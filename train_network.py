@@ -9,9 +9,9 @@ import numpy as np
 import tensorboardX
 import torch
 import torch.utils.data
-from hardware.device import get_device
 from torch import optim
 
+from hardware.device import get_device
 from inference.models import get_network
 from inference.post_process import post_process_output
 from utils.data import get_dataset

@@ -109,15 +109,25 @@ Câu này thuộc về abstract.
 
 Repo hiện là Grasp-Anything gốc, chưa có gì liên quan text.
 
-- Thiếu hẳn package `hardware/` — `from hardware.device import get_device` ở
-  `train_network.py:12`, `evaluate.py:8`, `train_network_grasp_det_seg.py:13`.
-- `utils/data/grasp_data.py:92` trả `x, (pos,cos,sin,width), idx, rot, zoom` — cần mở rộng;
-  `inference/models/grasp_model.py:19` hard-code chữ ký 4 tensor.
-- `utils/data/grasp_anything_data.py:26-46`: `prompt_files` / `rgb_files` được sort nhưng
-  **không** filter theo seen/unseen như `grasp_files` → index song song lệch hoàn toàn.
-  Luôn derive path từ `grasp_files[idx]`.
-- `utils/data/grasp_anything_data.py:98`: regex `_\d{1}\.pt` chỉ khớp 1 chữ số →
-  scene ≥10 object ghép sai ảnh. Sửa thành `_\d+\.pt`.
+**Đã fix:**
+
+- Thêm package `hardware/` (`device.py` + `camera.py`) — trước đó thiếu hẳn, khiến
+  `train_network.py`, `evaluate.py`, `train_network_grasp_det_seg.py` ImportError ngay.
+- `utils/data/grasp_anything_data.py`: bỏ `prompt_files` / `rgb_files` glob song song
+  (chúng **không** được filter theo seen/unseen như `grasp_files`, và nhiều grasp file
+  dùng chung một ảnh). Mọi path giờ derive từ `grasp_files[idx]` qua
+  `get_rgb_file()` / `get_prompt_file()`.
+- Regex `_\d{1}\.pt` → `_\d+\.pt`. Regex cũ **không khớp gì cả** với scene ≥10 object
+  (`abc_10.pt` giữ nguyên) → đường dẫn ảnh thành `image/abc_10.pt` → FileNotFoundError.
+  Toàn bộ object thứ 10 trở đi của mọi scene lớn bị hỏng.
+- `get_depth()` raise NotImplementedError với thông báo rõ thay vì AttributeError trên
+  `self.depth_files` (attribute không bao giờ được gán — Grasp-Anything chỉ có RGB).
+
+**Còn lại:**
+
+- `utils/data/grasp_data.py:92` trả `x, (pos,cos,sin,width), idx, rot, zoom` — cần mở rộng
+  để trả thêm prompt tokens và `M_∪`; `inference/models/grasp_model.py:19` hard-code
+  chữ ký 4 tensor.
 - `scene_description/*.pkl` là mô tả scene-level, không phải grasping prompt của GA++.
 - CLIP `encode_text()` chỉ trả EOT token; muốn per-token phải chạy
   `transformer → ln_final → @ text_projection` cho cả chuỗi, và mask SOT/EOT/padding
