@@ -62,6 +62,20 @@ def parse_args():
         "--dataset", type=str, help='Dataset Name ("cornell" or "jaquard")'
     )
     parser.add_argument("--dataset-path", type=str, help="Path to dataset")
+
+    # Nhánh text-visual alignment (chỉ dùng bởi network grconvnet3_align)
+    parser.add_argument(
+        "--use-text", type=int, default=1, help="Bật nhánh ngôn ngữ (1/0). 0 = baseline no-text"
+    )
+    parser.add_argument(
+        "--w-align", type=float, default=1.0, help="Trọng số L_align(A_T, part_mask)"
+    )
+    parser.add_argument(
+        "--w-agnostic", type=float, default=1.0, help="Trọng số L_agnostic(Q_g, M_union)"
+    )
+    parser.add_argument(
+        "--warmup-epochs", type=int, default=5, help="Số epoch warmup trọng số hai loss phụ"
+    )
     parser.add_argument(
         "--split",
         type=float,
@@ -121,6 +135,23 @@ def parse_args():
     return args
 
 
+def batch_extras(net, batch, device):
+    """
+    Lấy prompt / part_mask / union_pos ở phần tử thứ 6 của batch (chỉ Grasp-Anything++ có).
+    Model không khai báo `accepts_extras` thì trả dict rỗng -> chữ ký compute_loss cũ giữ nguyên.
+    """
+    if len(batch) < 6 or not getattr(net, "accepts_extras", False):
+        return {}
+    extra = batch[5]
+    kwargs = {}
+    if "prompt" in extra:
+        kwargs["prompts"] = extra["prompt"]
+    for key in ("part_mask", "union_pos"):
+        if key in extra:
+            kwargs[key] = extra[key].to(device)
+    return kwargs
+
+
 def validate(net, device, val_data, iou_threshold):
     """
     Run validation.
@@ -137,10 +168,12 @@ def validate(net, device, val_data, iou_threshold):
     ld = len(val_data)
 
     with torch.no_grad():
-        for x, y, didx, rot, zoom_factor in val_data:
+        for batch in val_data:
+            # GA++ trả thêm phần tử thứ 6 (prompt / part_mask); các dataset khác trả đúng 5.
+            x, y, didx, rot, zoom_factor = batch[:5]
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc)
+            lossd = net.compute_loss(xc, yc, **batch_extras(net, batch, device))
 
             loss = lossd["loss"]
 
@@ -193,14 +226,16 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
-        for x, y, _, _, _ in train_data:
+        for batch in train_data:
+            x, y = batch[0], batch[1]
+            extras = batch_extras(net, batch, device)
             batch_idx += 1
             if batch_idx >= batches_per_epoch:
                 break
 
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc)
+            lossd = net.compute_loss(xc, yc, **extras)
 
             loss = lossd["loss"]
 
@@ -339,12 +374,19 @@ def run():
     logging.info("Loading Network...")
     input_channels = 1 * args.use_depth + 3 * args.use_rgb
     network = get_network(args.network)
-    net = network(
+    net_kwargs = dict(
         input_channels=input_channels,
         dropout=args.use_dropout,
         prob=args.dropout_prob,
         channel_size=args.channel_size,
     )
+    if getattr(network, "accepts_extras", False):
+        net_kwargs.update(
+            use_text=bool(args.use_text),
+            w_align=args.w_align,
+            w_agnostic=args.w_agnostic,
+        )
+    net = network(**net_kwargs)
 
     net = net.to(device)
     logging.info("Done")
@@ -367,6 +409,9 @@ def run():
     best_iou = 0.0
     for epoch in range(args.epochs):
         logging.info(f"Beginning Epoch {epoch:02d}")
+        if hasattr(net, "set_loss_warmup"):
+            # L_align/L_agnostic vào dần: A_T lúc đầu ngẫu nhiên, ép mạnh sẽ kéo hỏng nhánh grasp.
+            net.set_loss_warmup(min(1.0, (epoch + 1) / max(1, args.warmup_epochs)))
         train_results = train(
             epoch,
             net,

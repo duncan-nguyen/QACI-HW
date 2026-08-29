@@ -8,6 +8,9 @@ def get_dataset(dataset_name):
     elif dataset_name == 'grasp-anything':
         from .grasp_anything_data import GraspAnythingDataset
         return GraspAnythingDataset
+    elif dataset_name == 'grasp-anything-pp':
+        from .grasp_anything_pp_data import GraspAnythingPPDataset
+        return GraspAnythingPPDataset
     elif dataset_name == 'vmrd':
         from .vmrd_data import VMRDDataset
         return VMRDDataset

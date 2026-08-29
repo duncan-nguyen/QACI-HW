@@ -7,6 +7,8 @@
 # needs and lays it out in one directory:
 #
 #   <dest>/image/                 416x416 .jpg, named by SHA-256  (base repo, 65 GB)
+#   <dest>/scene_description/     .pkl (caption, [objects])        (base repo, needed to
+#                                 build the seen/unseen split -- see split/build_grasp_anything_pp.py)
 #   <dest>/grasp_instructions/    .pkl grasping prompts per scene (GA++)
 #   <dest>/grasp_label_positive/  .pt part-level positive grasps  (GA++)
 #   <dest>/part_mask/             .npy part-level masks           (GA++)
@@ -52,7 +54,7 @@ human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 if [[ "$CHECK_ONLY" == 1 ]]; then
     echo "Checking $DEST"
     status=0
-    for d in image grasp_instructions grasp_label_positive part_mask; do
+    for d in image scene_description grasp_instructions grasp_label_positive part_mask; do
         if [[ -d "$DEST/$d" ]]; then
             n=$(find "$DEST/$d" -maxdepth 1 -type f | wc -l)
             printf "  %-22s %8d files\n" "$d" "$n"
@@ -143,6 +145,12 @@ else
     fi
     extract image.zip image
 fi
+
+# --------------------------------- 1b. scene descriptions (base repo, 0.34 GB) --
+echo
+echo "== 1b/3  scene_description from $REPO_BASE (0.34 GB, needed for the split) =="
+fetch "$REPO_BASE" scene_description.zip
+extract scene_description.zip scene_description
 
 # ------------------------------------------------- 2. GA++ labels ------------
 echo

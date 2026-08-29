@@ -7,6 +7,10 @@ class GraspModel(nn.Module):
     An abstract model for grasp network in a common format.
     """
 
+    # Đặt True ở model nhận thêm prompt / part_mask / union_pos từ dataset (xem
+    # grconvnet3_align.py). Vòng train/eval dựa vào cờ này để biết có truyền extras hay không.
+    accepts_extras = False
+
     def __init__(self):
         super(GraspModel, self).__init__()
 

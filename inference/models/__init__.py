@@ -13,6 +13,10 @@ def get_network(network_name):
         from .grconvnet3 import GenerativeResnet
         return GenerativeResnet
     # Inverted GR-ConvNet
+    # GR-ConvNet-3 + text-visual alignment ở mức part (Grasp-Anything++)
+    elif network_name == 'grconvnet3_align':
+        from .grconvnet3_align import GenerativeResnetAlign
+        return GenerativeResnetAlign
     elif network_name == 'grconvnet4':
         from .grconvnet4 import GenerativeResnet
         return GenerativeResnet

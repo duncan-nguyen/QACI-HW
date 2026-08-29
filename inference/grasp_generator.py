@@ -43,9 +43,11 @@ class GraspGenerator:
 
     def load_model(self):
         print('Loading model... ')
-        self.model = torch.load(self.saved_model_path)
-        # Get the compute device
+        # Chọn device trước khi load, để map_location có giá trị thật.
         self.device = get_device(force_cpu=False)
+        self.model = torch.load(
+            self.saved_model_path, map_location=self.device, weights_only=False
+        )
 
     def generate(self):
         # Get RGB-D image from camera
