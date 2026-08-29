@@ -193,12 +193,29 @@ class GraspAnythingPPDataset(GraspDatasetBase):
             "Grasp-Anything++ chỉ có RGB; train với --use-depth 0."
         )
 
+    def _augment(self, img, rot, zoom):
+        """
+        crop(zoom) -> resize(output_size) -> rotate.
+
+        Thứ tự gốc của repo là rotate -> zoom -> resize, tức là hai phép nội suy đắt nhất chạy
+        ở 416x416 rồi mới hạ xuống 224 -- tốn gấp ~3,4 lần số pixel mà kết quả không khác.
+        Với góc xoay bội số 90° (đúng những góc `random_rotate` sinh ra) thì crop tâm và xoay
+        giao hoán, nên đảo thứ tự là tương đương về hình học.
+
+        :param img: image.Image, sẽ bị sửa tại chỗ
+        """
+        if zoom != 1.0:
+            h, w = img.img.shape[0], img.img.shape[1]
+            sr, sc = int(h * (1 - zoom)) // 2, int(w * (1 - zoom)) // 2
+            img.img = img.img[sr:h - sr, sc:w - sc]
+        img.resize((self.output_size, self.output_size))
+        if rot != 0.0:
+            img.rotate(rot)
+        return img
+
     def get_rgb(self, idx, rot=0, zoom=1.0, normalise=True):
         rot, zoom = float(rot), float(zoom)
-        rgb_img = image.Image.from_file(self.get_rgb_file(idx))
-        rgb_img.rotate(rot)
-        rgb_img.zoom(zoom)
-        rgb_img.resize((self.output_size, self.output_size))
+        rgb_img = self._augment(image.Image.from_file(self.get_rgb_file(idx)), rot, zoom)
         if normalise:
             rgb_img.normalise()
             rgb_img.img = rgb_img.img.transpose((2, 0, 1))
@@ -219,12 +236,21 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         (rotate -> zoom -> resize) để alignment loss không học lệch.
         """
         rot, zoom = float(rot), float(zoom)
-        mask_img = image.Image(np.load(self.get_mask_file(idx)).astype(np.float32))
-        mask_img.rotate(rot)
-        mask_img.zoom(zoom)
-        mask_img.resize((self.output_size, self.output_size))
+        mask_img = image.Image(self._load_mask(idx).astype(np.float32))
+        self._augment(mask_img, rot, zoom)
         # Nội suy làm mask hết nhị phân -> ngưỡng lại.
         return (mask_img.img > 0.5).astype(np.float32)
+
+    def _load_mask(self, idx):
+        """
+        part_mask 416x416 uint8. Chấp nhận cả bản đóng gói bit (mảng 1 chiều 21.632 byte) --
+        `script/build_ga_pp_subset.py --pack-masks` lưu kiểu đó, nhỏ hơn 8 lần trên đĩa.
+        """
+        mask = np.load(self.get_mask_file(idx))
+        if mask.ndim == 1:
+            mask = np.unpackbits(mask)[:SOURCE_SIZE * SOURCE_SIZE].reshape(SOURCE_SIZE,
+                                                                          SOURCE_SIZE)
+        return mask
 
     def get_union_gtbb(self, idx, rot=0, zoom=1.0):
         """

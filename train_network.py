@@ -103,6 +103,13 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate (mặc định: 1e-3 cho adam, 0.01 cho sgd). Đổi batch size thì nên "
+        "đổi theo, quy tắc thô là scale tuyến tính.",
+    )
+    parser.add_argument(
         "--batches-per-epoch", type=int, default=1000, help="Batches per Epoch"
     )
     parser.add_argument(
@@ -407,10 +414,12 @@ def run():
     net = net.to(device)
     logging.info("Done")
 
+    # CLIP text encoder bị đóng băng -> lọc ra khỏi optimizer cho gọn.
+    params = [p for p in net.parameters() if p.requires_grad]
     if args.optim.lower() == "adam":
-        optimizer = optim.Adam(net.parameters())
+        optimizer = optim.Adam(params, lr=args.lr if args.lr else 1e-3)
     elif args.optim.lower() == "sgd":
-        optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+        optimizer = optim.SGD(params, lr=args.lr if args.lr else 0.01, momentum=0.9)
     else:
         raise NotImplementedError(f"Optimizer {args.optim} is not implemented")
 

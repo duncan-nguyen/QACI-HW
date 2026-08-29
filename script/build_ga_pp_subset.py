@@ -114,6 +114,27 @@ def read_member(read_at, offset, csize, method):
     return zlib.decompressobj(-15).decompress(raw) if method == 8 else raw
 
 
+def local_reader_multi(paths):
+    """Như local_reader nhưng cho archive bị chẻ nhiều part (image_part_aa + ab), map offset
+    logic sang (file, offset thật) mà không phải nối 65 GB lại."""
+    handles = [open(p, "rb") for p in paths]
+    sizes = [os.path.getsize(p) for p in paths]
+    lock = threading.Lock()
+
+    def read_at(a, b):
+        out, base = b"", 0
+        for fh, n in zip(handles, sizes):
+            lo, hi = base, base + n - 1
+            if a <= hi and b >= lo:
+                with lock:
+                    fh.seek(max(a, lo) - base)
+                    out += fh.read(min(b, hi) - max(a, lo) + 1)
+            base += n
+        return out
+
+    return read_at, sum(sizes)
+
+
 def local_reader(path):
     lock = threading.Lock()
     fh = open(path, "rb")
@@ -185,6 +206,18 @@ def download(repo, name, dest):
 
 
 # ------------------------------------------------------------------- chọn ----
+def pack_mask(payload):
+    """part_mask nhị phân 416x416 uint8 -> mảng bit đóng gói (173 KB -> 21 KB)."""
+    import io
+
+    import numpy as np
+
+    mask = np.load(io.BytesIO(payload))
+    buf = io.BytesIO()
+    np.save(buf, np.packbits(mask.astype(bool).ravel()))
+    return buf.getvalue()
+
+
 def keeps_scene(scene, every):
     """Chọn xác định theo hash: cùng `every` thì mọi archive chọn ra cùng tập scene."""
     return int(hashlib.md5(scene.encode()).hexdigest()[:8], 16) % every == 0
@@ -204,6 +237,12 @@ def parse_args():
     p.add_argument("--workers", type=int, default=16, help="Số luồng tải ảnh")
     p.add_argument("--skip-images", action="store_true",
                    help="Bỏ bước tải ảnh (khi ảnh đã có sẵn)")
+    p.add_argument("--images-from-zip", action="store_true",
+                   help="Tải hẳn image_part_aa+ab (65 GB) rồi trích ảnh từ đĩa, thay vì đọc "
+                        "từng ảnh qua HTTP. Đáng dùng khi > ~40k scene.")
+    p.add_argument("--pack-masks", action="store_true",
+                   help="Lưu part_mask dưới dạng bit đóng gói: 21 KB thay vì 173 KB mỗi file "
+                        "(nhỏ hơn 8 lần, loader tự nhận ra). Bật khi subset lớn.")
     p.add_argument("--keep-zips", action="store_true", help="Giữ lại zip sau khi trích")
     return p.parse_args()
 
@@ -238,8 +277,11 @@ def main():
                 continue
             dest = os.path.join(target, os.path.basename(entry_name))
             if not os.path.isfile(dest):
+                payload = read_member(read_at, off, csize, method)
+                if args.pack_masks and folder == "part_mask":
+                    payload = pack_mask(payload)
                 with open(dest, "wb") as f:
-                    f.write(read_member(read_at, off, csize, method))
+                    f.write(payload)
             scenes.add(scene)
             n_kept += 1
             if n_kept % 2000 == 0:
@@ -252,6 +294,9 @@ def main():
 
     if args.skip_images:
         print("\n== 3/4  bỏ qua ảnh (--skip-images) ==")
+    elif args.images_from_zip:
+        print(f"\n== 3/4  tải archive ảnh (65 GB) rồi trích {len(scenes):,} ảnh ==")
+        fetch_images_from_zip(scenes, os.path.join(out, "image"), zips_dir)
     else:
         print(f"\n== 3/4  tải {len(scenes):,} ảnh qua HTTP range (không tải 65 GB) ==")
         fetch_images(scenes, os.path.join(out, "image"), args.workers)
@@ -265,6 +310,33 @@ def main():
         shutil.rmtree(zips_dir, ignore_errors=True)
         print(f"  (đã xoá {zips_dir}; --keep-zips để giữ lại)")
     print(f"\nTiếp: python split/build_grasp_anything_pp.py --data-dir {out}")
+
+
+def fetch_images_from_zip(scenes, target, zips_dir):
+    """Tải image_part_aa + ab về rồi trích các ảnh cần. Với subset lớn thì rẻ hơn hẳn đọc
+    từng ảnh qua HTTP: 65 GB tải một lần là chuyện băng thông, còn ~550 ms/ảnh là chuyện
+    latency và không co lại theo băng thông."""
+    os.makedirs(target, exist_ok=True)
+    parts = []
+    for name in ("image_part_aa", "image_part_ab"):
+        dest = os.path.join(zips_dir, name)
+        download(REPO_BASE, name, dest)
+        parts.append(dest)
+
+    read_at, size = local_reader_multi(parts)
+    need = {s for s in scenes if not os.path.isfile(os.path.join(target, s + ".jpg"))}
+    print(f"  quét central directory ({size / 1e9:.0f} GB)...")
+    done = 0
+    for name, off, csize, method in iter_central_dir(read_at, size):
+        scene = os.path.splitext(os.path.basename(name))[0]
+        if scene not in need:
+            continue
+        with open(os.path.join(target, scene + ".jpg"), "wb") as f:
+            f.write(read_member(read_at, off, csize, method))
+        done += 1
+        if done % 500 == 0:
+            print(f"\r  {done:,}/{len(need):,} ảnh", end="")
+    print(f"\r  {done:,}/{len(need):,} ảnh")
 
 
 def fetch_images(scenes, target, workers):
