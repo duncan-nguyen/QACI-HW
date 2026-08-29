@@ -368,14 +368,21 @@ def run():
     train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_indices)
     val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
 
+    # train() tạo lại iterator sau mỗi vòng `while batch_idx <= batches_per_epoch`, nên
+    # persistent_workers tiết kiệm hẳn việc spawn lại worker. Loader của GA++ nặng CPU
+    # (decode JPEG + rotate/zoom cho ảnh, part_mask và M_union) nên prefetch cũng đáng.
+    loader_kwargs = dict(num_workers=args.num_workers)
+    if args.num_workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4, pin_memory=True)
+
     train_data = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
         sampler=train_sampler,
+        **loader_kwargs,
     )
     val_data = torch.utils.data.DataLoader(
-        dataset, batch_size=1, num_workers=args.num_workers, sampler=val_sampler
+        dataset, batch_size=1, sampler=val_sampler, **loader_kwargs
     )
     logging.info("Done")
 
