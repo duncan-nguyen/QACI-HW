@@ -62,6 +62,12 @@ def parse_args():
         "--dataset", type=str, help='Dataset Name ("cornell" or "jaquard")'
     )
     parser.add_argument("--dataset-path", type=str, help="Path to dataset")
+    parser.add_argument(
+        "--split-path",
+        type=str,
+        default=None,
+        help="Thư mục chứa seen.obj/unseen.obj (mặc định dò theo SPLIT_DIRS của loader)",
+    )
 
     # Nhánh text-visual alignment (chỉ dùng bởi network grconvnet3_align)
     parser.add_argument(
@@ -333,8 +339,7 @@ def run():
     # Load Dataset
     logging.info(f"Loading {args.dataset.title()} Dataset...")
     Dataset = get_dataset(args.dataset)
-    dataset = Dataset(
-        args.dataset_path,
+    ds_kwargs = dict(
         output_size=args.input_size,
         ds_rotate=args.ds_rotate,
         random_rotate=True,
@@ -343,6 +348,10 @@ def run():
         include_rgb=args.use_rgb,
         seen=args.seen,
     )
+    # Chỉ truyền khi có, vì các loader khác (cornell/jacquard/...) không nhận kwarg này.
+    if args.split_path:
+        ds_kwargs["split_path"] = args.split_path
+    dataset = Dataset(args.dataset_path, **ds_kwargs)
     logging.info(f"Dataset size is {dataset.length}")
 
     # Creating data indices for training and validation splits

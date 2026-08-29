@@ -68,6 +68,18 @@ class CLIPTextEncoder(nn.Module):
         self.model.eval()
         return self
 
+    def token_strings(self, prompts):
+        """
+        Chuỗi token thật sự đưa vào encoder, để gán nhãn cho hình alignment.
+
+        :return: list[list[str]] cùng chiều dài với chiều L của forward() (kể cả SOT/EOT/pad,
+                 dùng chung mask với forward để lọc).
+        """
+        tok = self.tokenizer(list(prompts), padding='max_length', truncation=True,
+                             max_length=self.max_length)
+        return [[self.tokenizer.convert_ids_to_tokens(i) for i in ids]
+                for ids in tok['input_ids']]
+
     @torch.no_grad()
     def forward(self, prompts):
         """
@@ -102,18 +114,26 @@ class TokenPixelAlignment(nn.Module):
         # Cosine ∈ [-1, 1] không đủ dải cho BCE -> cần nhiệt độ học được.
         self.logit_scale = nn.Parameter(torch.tensor(1.0 / init_temperature).log())
 
-    def forward(self, feat, text_emb, text_mask):
+    def per_token(self, feat, text_emb, text_mask):
         """
-        :param feat: (B, C, H, W)
-        :param text_emb: (B, L, D)
-        :param text_mask: (B, L) bool, True ở token nội dung
-        :return: (B, 1, H, W) logits alignment
+        Bản đồ alignment của **từng** token -- đây là thứ để visualize "token nào ăn vùng nào".
+
+        :return: (B, L, H, W) logits; token bị mask có giá trị -inf
         """
         v = F.normalize(self.v_proj(feat), dim=1)                     # (B, P, H, W)
         t = F.normalize(self.t_proj(text_emb), dim=-1)                # (B, L, P)
 
         sim = torch.einsum('bphw,blp->blhw', v, t) * self.logit_scale.exp().clamp(max=100.0)
-        sim = sim.masked_fill(~text_mask[:, :, None, None], float('-inf'))
+        return sim.masked_fill(~text_mask[:, :, None, None], float('-inf'))
+
+    def forward(self, feat, text_emb, text_mask):
+        """
+        :param feat: (B, C, H, W)
+        :param text_emb: (B, L, D)
+        :param text_mask: (B, L) bool, True ở token nội dung
+        :return: (B, 1, H, W) logits alignment (max theo token)
+        """
+        sim = self.per_token(feat, text_emb, text_mask)
         logits = sim.max(dim=1).values                                # (B, H, W)
         # Prompt rỗng (không còn token nào) -> -inf; đưa về 0 để loss không thành NaN.
         logits = torch.nan_to_num(logits, neginf=0.0)
@@ -238,9 +258,42 @@ class GenerativeResnetAlign(GenerativeResnet):
             out['align'] = torch.sigmoid(align_logits)
         return out
 
+    @torch.no_grad()
+    def token_alignment(self, x_in, prompts):
+        """
+        Alignment token-pixel cho việc visualize.
+
+        :return: dict
+            tokens     list[list[str]] -- token nội dung của từng prompt (đã bỏ SOT/EOT/pad)
+            maps       (B, L_i, H, W) similarity của từng token, đã chuẩn hoá về [0, 1]
+            attention  (B, 1, H, W) A_T = sigmoid(max theo token), chính thứ dùng để gate
+        """
+        if not self.use_text:
+            raise RuntimeError('Model khởi tạo với use_text=False, không có nhánh alignment.')
+
+        feat = self.encode(x_in)
+        text_emb, text_mask = self.text_encoder(prompts)
+        sim = self.align.per_token(feat, text_emb.to(feat.dtype), text_mask)   # (B, L, H, W)
+        attention = torch.sigmoid(self.align(feat, text_emb.to(feat.dtype), text_mask))
+
+        all_tokens = self.text_encoder.token_strings(prompts)
+        tokens, maps = [], []
+        for b in range(sim.shape[0]):
+            keep = text_mask[b].nonzero(as_tuple=True)[0]
+            tokens.append([_clean_token(all_tokens[b][i]) for i in keep.tolist()])
+            m = sim[b, keep]                                                   # (L_i, H, W)
+            lo, hi = m.amin(), m.amax()
+            maps.append((m - lo) / (hi - lo + 1e-8))
+        return {'tokens': tokens, 'maps': maps, 'attention': attention}
+
     def set_loss_warmup(self, value):
         """Gọi mỗi epoch: 0 -> 1 trong vài epoch đầu."""
         self.loss_warmup.fill_(float(value))
+
+
+def _clean_token(token):
+    """CLIP BPE gắn hậu tố `</w>` ở token cuối từ -- bỏ đi cho dễ đọc."""
+    return token.replace('</w>', '')
 
 
 def _match_resolution(target, like):

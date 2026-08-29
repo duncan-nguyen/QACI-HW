@@ -16,6 +16,7 @@ set -euo pipefail
 NETWORK="${1:?cần đường dẫn checkpoint}"
 DATA="${2:-data/grasp-anything-pp}"
 SPLIT="${3:-0.99}"
+PYTHON="${PYTHON:-python}"
 
 if [ ! -f "$NETWORK" ]; then
     echo "Không thấy checkpoint: $NETWORK" >&2
@@ -23,7 +24,7 @@ if [ ! -f "$NETWORK" ]; then
 fi
 
 run_split() {  # run_split <seen 1|0>
-    python evaluate.py \
+    "$PYTHON" evaluate.py \
         --dataset grasp-anything-pp \
         --dataset-path "$DATA" \
         --network "$NETWORK" \
@@ -41,7 +42,7 @@ SEEN=$(run_split 1)
 echo "== unseen (New) =="
 UNSEEN=$(run_split 0)
 
-python - "$SEEN" "$UNSEEN" <<'PY'
+"$PYTHON" - "$SEEN" "$UNSEEN" <<'PY'
 import sys
 
 seen, unseen = float(sys.argv[1]), float(sys.argv[2])
