@@ -103,6 +103,14 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="none",
+        choices=["none", "cosine", "step"],
+        help="Lịch giảm learning rate. 'none' giữ nguyên hành vi cũ; 'cosine' giảm mượt về 0; "
+        "'step' chia 10 ở 60%% và 85%% số epoch.",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=None,
@@ -423,6 +431,14 @@ def run():
     else:
         raise NotImplementedError(f"Optimizer {args.optim} is not implemented")
 
+    if args.lr_schedule == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    elif args.lr_schedule == "step":
+        milestones = [int(args.epochs * 0.6), int(args.epochs * 0.85)]
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
+    else:
+        scheduler = None
+
     # Print model architecture.
     # summary(net, (input_channels, args.input_size, args.input_size))
     # f = open(os.path.join(save_folder, 'arch.txt'), 'w')
@@ -485,6 +501,10 @@ def run():
                 net, os.path.join(save_folder, "epoch_%02d_iou_%0.2f" % (epoch, iou))
             )
             best_iou = iou
+
+        if scheduler is not None:
+            scheduler.step()
+            tb.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
 
 if __name__ == "__main__":
