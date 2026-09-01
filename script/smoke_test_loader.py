@@ -139,7 +139,7 @@ def random_rects(n, as_int=False):
 
 
 def test_draw():
-    print("\n4. GraspRectangles.draw (cv2.fillConvexPoly thay skimage.draw.polygon)")
+    print("\n4. GraspRectangles.draw (cv2.fillConvexPoly instead of skimage.draw.polygon)")
     area_diff = area_total = 0.0
     lit = wrong_winner = 0
     for _ in range(30):
