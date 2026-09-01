@@ -5,7 +5,6 @@ import logging
 import os
 
 import cv2
-import numpy as np
 import tensorboardX
 import torch
 import torch.utils.data
@@ -15,6 +14,7 @@ from hardware.device import get_device
 from inference.models import get_network
 from inference.post_process import post_process_output
 from utils.data import get_dataset
+from utils.data.index_split import describe, index_splits
 from utils.dataset_processing import evaluation
 from utils.visualisation.gridshow import gridshow
 
@@ -71,22 +71,40 @@ def parse_args():
 
     # Nhánh text-visual alignment (chỉ dùng bởi network grconvnet3_align)
     parser.add_argument(
-        "--use-text", type=int, default=1, help="Bật nhánh ngôn ngữ (1/0). 0 = baseline no-text"
+        "--use-text",
+        type=int,
+        default=1,
+        help="Bật nhánh ngôn ngữ (1/0). 0 = baseline no-text",
     )
     parser.add_argument(
         "--w-align", type=float, default=1.0, help="Trọng số L_align(A_T, part_mask)"
     )
     parser.add_argument(
-        "--w-agnostic", type=float, default=1.0, help="Trọng số L_agnostic(Q_g, M_union)"
+        "--w-agnostic",
+        type=float,
+        default=1.0,
+        help="Trọng số L_agnostic(Q_g, M_union)",
     )
     parser.add_argument(
-        "--warmup-epochs", type=int, default=5, help="Số epoch warmup trọng số hai loss phụ"
+        "--warmup-epochs",
+        type=int,
+        default=5,
+        help="Số epoch warmup trọng số hai loss phụ",
     )
     parser.add_argument(
         "--split",
         type=float,
         default=0.9,
-        help="Fraction of data for training (remainder is validation)",
+        help="Fraction of the dev set (everything outside --test-split) used for training; "
+        "the remainder is validation",
+    )
+    parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.0,
+        help="Tỉ lệ dataset giữ lại làm test, cắt ở cuối danh sách và KHÔNG dùng lúc train "
+        "hay chọn checkpoint. Đánh giá bằng `evaluate.py --subset test` với cùng --split/"
+        "--test-split/--ds-shuffle. Mặc định 0.0 = hành vi cũ (không có tập test độc lập).",
     )
     parser.add_argument(
         "--ds-shuffle", action="store_true", default=False, help="Shuffle the dataset"
@@ -246,13 +264,16 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
 
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
-    while batch_idx <= batches_per_epoch:
+    # Điều kiện dừng nằm ở đầu vòng trong: bản cũ tăng `batch_idx` rồi mới break, nên vòng
+    # ngoài vào lại một lần nữa, nạp thêm một batch (và copy part_mask/union_pos lên GPU) chỉ
+    # để vứt đi -- kết quả là 1.999 optimizer step cho --batches-per-epoch 2000.
+    while batch_idx < batches_per_epoch:
         for batch in train_data:
+            if batch_idx >= batches_per_epoch:
+                break
             x, y = batch[0], batch[1]
             extras = batch_extras(net, batch, device)
             batch_idx += 1
-            if batch_idx >= batches_per_epoch:
-                break
 
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
@@ -367,17 +388,32 @@ def run():
     if args.split_path:
         ds_kwargs["split_path"] = args.split_path
     dataset = Dataset(args.dataset_path, **ds_kwargs)
+    # Validation phải chạy trên dữ liệu *không* augmentation: xem GraspDatasetBase.eval_view().
+    val_dataset = dataset.eval_view()
     logging.info(f"Dataset size is {dataset.length}")
 
     # Creating data indices for training and validation splits
-    indices = list(range(dataset.length))
-    split = int(np.floor(args.split * dataset.length))
-    if args.ds_shuffle:
-        np.random.seed(args.random_seed)
-        np.random.shuffle(indices)
-    train_indices, val_indices = indices[:split], indices[split:]
-    logging.info(f"Training size: {len(train_indices)}")
-    logging.info(f"Validation size: {len(val_indices)}")
+    splits = index_splits(
+        dataset.length,
+        train_frac=args.split,
+        test_frac=args.test_split,
+        shuffle=args.ds_shuffle,
+        seed=args.random_seed,
+    )
+    train_indices, val_indices = splits["train"], splits["val"]
+    logging.info(f"Index splits: {describe(splits)}")
+    if splits["test"]:
+        # Ghi rõ ra log để `evaluate.py --subset test` tái lập được đúng lát cắt này.
+        logging.info(
+            "Test set giữ nguyên, không dùng để train hay chọn checkpoint. Đánh giá bằng: "
+            f"evaluate.py --subset test --split {args.split} --test-split {args.test_split}"
+            f"{' --ds-shuffle' if args.ds_shuffle else ''} --random-seed {args.random_seed}"
+        )
+    else:
+        logging.warning(
+            "--test-split 0.0: không có tập test độc lập. Chỉ số 'test' báo cáo sau này sẽ "
+            "chính là tập validation đã dùng để chọn checkpoint."
+        )
 
     # Creating data samplers and loaders
     train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_indices)
@@ -388,7 +424,9 @@ def run():
     # (decode JPEG + rotate/zoom cho ảnh, part_mask và M_union) nên prefetch cũng đáng.
     loader_kwargs = dict(num_workers=args.num_workers)
     if args.num_workers > 0:
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=4, pin_memory=True)
+        loader_kwargs.update(
+            persistent_workers=True, prefetch_factor=4, pin_memory=True
+        )
 
     train_data = torch.utils.data.DataLoader(
         dataset,
@@ -397,7 +435,7 @@ def run():
         **loader_kwargs,
     )
     val_data = torch.utils.data.DataLoader(
-        dataset, batch_size=1, sampler=val_sampler, **loader_kwargs
+        val_dataset, batch_size=1, sampler=val_sampler, **loader_kwargs
     )
     logging.info("Done")
 
@@ -435,7 +473,9 @@ def run():
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     elif args.lr_schedule == "step":
         milestones = [int(args.epochs * 0.6), int(args.epochs * 0.85)]
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=milestones, gamma=0.1
+        )
     else:
         scheduler = None
 
@@ -496,11 +536,19 @@ def run():
         iou = test_results["correct"] / (
             test_results["correct"] + test_results["failed"]
         )
-        if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+        # `best_iou` chỉ được cập nhật khi thật sự tốt hơn. Bản cũ đặt nó bên trong nhánh
+        # `or (epoch % 10) == 0`, nên mỗi epoch chia hết cho 10 lại hạ mốc xuống một giá trị
+        # có thể tệ hơn, khiến các epoch sau đó được lưu như "best" giả.
+        is_best = iou > best_iou
+        if is_best or epoch == 0 or (epoch % 10) == 0:
+            # 4 chữ số thập phân: %0.2f làm tròn khiến nhiều epoch trùng tên và phải grep log
+            # mới biết checkpoint nào thật sự tốt nhất.
             torch.save(
-                net, os.path.join(save_folder, "epoch_%02d_iou_%0.2f" % (epoch, iou))
+                net, os.path.join(save_folder, "epoch_%02d_iou_%0.4f" % (epoch, iou))
             )
+        if is_best:
             best_iou = iou
+            logging.info(f"New best IoU {best_iou:.4f} at epoch {epoch}")
 
         if scheduler is not None:
             scheduler.step()

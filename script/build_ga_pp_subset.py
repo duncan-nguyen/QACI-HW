@@ -218,6 +218,21 @@ def pack_mask(payload):
     return buf.getvalue()
 
 
+def write_atomic(dest, payload):
+    """
+    Ghi qua file tạm rồi `os.replace`.
+
+    Ghi thẳng vào đích thì một lần đứt mạng/Ctrl-C giữa chừng để lại file cụt, mà lần chạy
+    sau chỉ kiểm tra `os.path.isfile` nên sẽ bỏ qua nó -- JPEG hỏng đi thẳng vào training và
+    không báo lỗi ở đâu cả. `os.replace` là atomic trên cùng một filesystem.
+    """
+    # Đuôi khác `.part` của download() để hai cơ chế không bao giờ giẫm lên nhau.
+    tmp = dest + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(payload)
+    os.replace(tmp, dest)
+
+
 def keeps_scene(scene, every):
     """Chọn xác định theo hash: cùng `every` thì mọi archive chọn ra cùng tập scene."""
     return int(hashlib.md5(scene.encode()).hexdigest()[:8], 16) % every == 0
@@ -280,8 +295,7 @@ def main():
                 payload = read_member(read_at, off, csize, method)
                 if args.pack_masks and folder == "part_mask":
                     payload = pack_mask(payload)
-                with open(dest, "wb") as f:
-                    f.write(payload)
+                write_atomic(dest, payload)
             scenes.add(scene)
             n_kept += 1
             if n_kept % 2000 == 0:
@@ -331,8 +345,8 @@ def fetch_images_from_zip(scenes, target, zips_dir):
         scene = os.path.splitext(os.path.basename(name))[0]
         if scene not in need:
             continue
-        with open(os.path.join(target, scene + ".jpg"), "wb") as f:
-            f.write(read_member(read_at, off, csize, method))
+        write_atomic(os.path.join(target, scene + ".jpg"),
+                     read_member(read_at, off, csize, method))
         done += 1
         if done % 500 == 0:
             print(f"\r  {done:,}/{len(need):,} ảnh", end="")
@@ -363,8 +377,7 @@ def fetch_images(scenes, target, workers):
         if not hasattr(local, "reader"):
             local.reader = RemoteReader(REPO_BASE, "image_part_aa", "image_part_ab")
         data = read_member(local.reader.read_at, off, csize, method)
-        with open(os.path.join(target, scene + ".jpg"), "wb") as f:
-            f.write(data)
+        write_atomic(os.path.join(target, scene + ".jpg"), data)
 
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:

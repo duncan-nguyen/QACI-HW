@@ -1,3 +1,4 @@
+import copy
 import random
 
 import numpy as np
@@ -10,8 +11,16 @@ class GraspDatasetBase(torch.utils.data.Dataset):
     An abstract dataset for training networks in a common format.
     """
 
-    def __init__(self, output_size=224, include_depth=True, include_rgb=False, random_rotate=False,
-                 random_zoom=False, input_only=False, seen=True):
+    def __init__(
+        self,
+        output_size=224,
+        include_depth=True,
+        include_rgb=False,
+        random_rotate=False,
+        random_zoom=False,
+        input_only=False,
+        seen=True,
+    ):
         """
         :param output_size: Image output size in pixels (square)
         :param include_depth: Whether depth image is included
@@ -30,7 +39,25 @@ class GraspDatasetBase(torch.utils.data.Dataset):
         self.grasp_files = []
 
         if include_depth is False and include_rgb is False:
-            raise ValueError('At least one of Depth or RGB must be specified.')
+            raise ValueError("At least one of Depth or RGB must be specified.")
+
+    def eval_view(self):
+        """
+        Bản sao *nông* của dataset với augmentation tắt, dùng cho validation/test.
+
+        Trước đây `train_network.py` đưa cùng một dataset (random_rotate/random_zoom bật) cho
+        cả train lẫn validate. Với `zoom ~ U(0.5, 1.0)` phép crop cắt tới một nửa khung hình,
+        mà `get_gtbb` không loại grasp rơi ra ngoài -- target thành rỗng và mẫu đó tự động
+        tính là fail. Chỉ số chọn checkpoint vì thế đo trên dữ liệu đã bị hỏng.
+
+        Sao chép nông (không `deepcopy`) là cố ý: `grasp_files` và các bảng index phụ dùng
+        chung tham chiếu, nên không tốn thêm bộ nhớ lẫn thời gian glob lại 880k file, mà mỗi
+        DataLoader worker vẫn nhận đúng cờ augmentation của bản sao.
+        """
+        view = copy.copy(self)
+        view.random_rotate = False
+        view.random_zoom = False
+        return view
 
     @staticmethod
     def numpy_to_torch(s):
@@ -72,15 +99,13 @@ class GraspDatasetBase(torch.utils.data.Dataset):
         bbs = self.get_gtbb(idx, rot, zoom_factor)
 
         pos_img, ang_img, width_img = bbs.draw((self.output_size, self.output_size))
-        width_img = np.clip(width_img, 0.0, self.output_size / 2) / (self.output_size / 2)
+        width_img = np.clip(width_img, 0.0, self.output_size / 2) / (
+            self.output_size / 2
+        )
 
         if self.include_depth and self.include_rgb:
             x = self.numpy_to_torch(
-                np.concatenate(
-                    (np.expand_dims(depth_img, 0),
-                     rgb_img),
-                    0
-                )
+                np.concatenate((np.expand_dims(depth_img, 0), rgb_img), 0)
             )
         elif self.include_depth:
             x = self.numpy_to_torch(depth_img)

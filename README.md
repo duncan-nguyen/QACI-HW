@@ -181,6 +181,24 @@ Thêm vào: `--split-path`, `--lr`, `--lr-schedule` cho `train_network.py`; Data
 `persistent_workers`/`prefetch`/`pin_memory`; loader GA++ đổi thứ tự augmentation sang
 `crop → resize → rotate` (nhanh 3,2×, tương đương về hình học với góc bội số 90°).
 
+### Sửa sau khi soi kết quả run 260830 (`results/`)
+
+Những lỗi làm *sai số liệu* chứ không làm chương trình chết, phát hiện khi đọc lại run GA++
+200k. Chi tiết ở docstring từng chỗ:
+
+| | Lỗi | Sửa |
+|---|---|---|
+| A1 | `split/build_grasp_anything_pp.py` lấy 70% category *nhiều nhất* cho Base, để lại 956/882.214 sample (0,1%) cho New; 295 scene nằm ở cả hai tập | `--split-mode balanced` (mặc định) chia theo **số sample**, category vẫn rời nhau; `--drop-shared-from seen` (mặc định) bỏ ảnh giao nhau khỏi train; cảnh báo khi một tập < 5% |
+| A2 | `evaluate.py` và `train_network.py` cắt index bằng hai đoạn code lặp lại nên "test set" trùng khít tập chọn checkpoint | Dùng chung `utils/data/index_split.py`; thêm `--test-split` (train) và `--subset {train,val,test,dev,all}` (evaluate) |
+| A3 | Validation chạy trên dataset bật `random_rotate`/`random_zoom`; `zoom ~ U(0.5, 1)` cắt mất grasp mà `get_gtbb` không loại → target rỗng, mẫu tự động fail | `GraspDatasetBase.eval_view()` — bản sao nông với augmentation tắt |
+| A4 | `best_iou` bị nhánh lưu định kỳ `epoch % 10` hạ xuống → lưu "best" giả | Chỉ cập nhật khi thật sự tốt hơn; tên file `%0.4f` thay vì `%0.2f` |
+| A5 | `evaluate.py` không gọi `net.eval()` (model có dropout 0,1 + BatchNorm) | `.eval()` ngay khi load |
+| A6 | Nhãn width chuẩn hoá `/(output_size/2)` nhưng decode `×150` — hằng 150 là `output_size/2` của GR-ConvNet gốc 300×300, với input 224 làm grasp dài hơn thật 1,34× | `post_process_output` suy `width_scale` từ kích thước ảnh (`×112` cho 224, vẫn `×150` cho 300) |
+| A7 | Vòng train nạp thừa một batch mỗi epoch rồi vứt → 1.999 step cho `--batches-per-epoch 2000` | Kiểm tra điều kiện dừng ở đầu vòng trong |
+| A8 | `GraspRectangle.iou` đánh index âm vào canvas → wrap-around, IoU sai ở grasp sát mép | Dịch cả hai polygon về gốc 0 |
+| A9 | `script/build_ga_pp_subset.py` ghi ảnh/label không atomic → đứt giữa chừng để lại file cụt mà lần chạy sau bỏ qua | `write_atomic()` qua file tạm + `os.replace` |
+| A10 | `script/diagnose_part_masks.py` (đo `part_mask` ở mức part hay mức object) bị gỡ khỏi branch này | Khôi phục từ branch `text-image-aware` |
+
 
 ## Acknowledgement
 Our codebase is developed based on [Kumra et al.](https://github.com/skumra/robotic-grasping).

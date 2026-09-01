@@ -2,12 +2,12 @@ import argparse
 import logging
 import time
 
-import numpy as np
 import torch.utils.data
 
 from hardware.device import get_device
 from inference.post_process import post_process_output
 from utils.data import get_dataset
+from utils.data.index_split import SUBSETS, describe, index_splits, select_subset
 from utils.dataset_processing import evaluation, grasp
 from utils.visualisation.plot import save_results
 
@@ -69,7 +69,23 @@ def parse_args():
         "--split",
         type=float,
         default=0.01,
-        help="Fraction of data for training (remainder is validation)",
+        help="Fraction of the dev set used for training; must match the value passed to "
+        "train_network.py so the subsets line up",
+    )
+    parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.0,
+        help="Phải khớp --test-split của train_network.py để tái lập đúng lát cắt.",
+    )
+    parser.add_argument(
+        "--subset",
+        type=str,
+        default="val",
+        choices=list(SUBSETS),
+        help="Lát cắt đem đánh giá. 'val' = hành vi cũ (mọi index sau --split), nhưng đó là "
+        "tập đã dùng chọn checkpoint nên số ra sẽ lạc quan. Dùng 'test' cho tập độc lập "
+        "(cần train với --test-split > 0), 'all' cho toàn bộ split seen/unseen.",
     )
     parser.add_argument(
         "--ds-shuffle", action="store_true", default=False, help="Shuffle the dataset"
@@ -152,14 +168,29 @@ if __name__ == "__main__":
         ds_kwargs["split_path"] = args.split_path
     test_dataset = Dataset(args.dataset_path, **ds_kwargs)
 
-    indices = list(range(test_dataset.length))
-    split = int(np.floor(args.split * test_dataset.length))
-    if args.ds_shuffle:
-        np.random.seed(args.random_seed)
-        np.random.shuffle(indices)
-    val_indices = indices[split:]
+    # Dùng chung utils/data/index_split.py với train_network.py: hai file cắt index bằng đúng
+    # một hàm nên không thể lệch nhau nữa.
+    splits = index_splits(
+        test_dataset.length,
+        train_frac=args.split,
+        test_frac=args.test_split,
+        shuffle=args.ds_shuffle,
+        seed=args.random_seed,
+    )
+    val_indices = select_subset(splits, args.subset)
+    if not val_indices:
+        raise SystemExit(
+            f"subset '{args.subset}' rỗng ({describe(splits)}). Với --subset test cần train "
+            "bằng --test-split > 0 và truyền lại đúng --split/--test-split/--ds-shuffle."
+        )
     val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
-    logging.info(f"Validation size: {len(val_indices)}")
+    logging.info(f"Index splits: {describe(splits)}")
+    logging.info(f"Evaluating subset '{args.subset}': {len(val_indices)} samples")
+    if args.subset == "val":
+        logging.warning(
+            "subset='val' là tập đã dùng để chọn checkpoint trong train_network.py -- con số "
+            "thu được lạc quan, không phải kết quả trên tập độc lập."
+        )
 
     test_data = torch.utils.data.DataLoader(
         test_dataset, batch_size=1, num_workers=args.num_workers, sampler=val_sampler
@@ -169,8 +200,10 @@ if __name__ == "__main__":
     for network in args.network:
         logging.info(f"\nEvaluating model {network}")
 
-        # Load Network
-        net = torch.load(network, map_location=device, weights_only=False)
+        # Load Network. `.eval()` là bắt buộc: model có dropout p=0.1 và BatchNorm, mà cờ
+        # training được lưu kèm checkpoint -- trước đây chỉ đúng nhờ may mắn (train_network.py
+        # tình cờ save ngay sau validate()).
+        net = torch.load(network, map_location=device, weights_only=False).eval()
 
         results = {"correct": 0, "failed": 0}
 
