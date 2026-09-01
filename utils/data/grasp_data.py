@@ -78,12 +78,17 @@ class GraspDatasetBase(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self.random_rotate:
             rotations = [0, np.pi / 2, 2 * np.pi / 2, 3 * np.pi / 2]
-            rot = random.choice(rotations)
+            # `float(...)` không thừa: phần tử đầu của `rotations` là *int* 0, nên khi nó rơi
+            # vào vị trí đầu batch, `default_collate` đi nhánh int và dựng tensor bằng
+            # `torch.tensor([0, 1.5707963267948966, ...])` -> ra float32, mất 8 chữ số của các
+            # góc còn lại. Với batch_size = 1 lỗi này không lộ ra; batch hoá validation thì
+            # `rot` mà validate dùng để dựng GT lệch khỏi `rot` mà loader đã dùng để xoay ảnh.
+            rot = float(random.choice(rotations))
         else:
             rot = 0.0
 
         if self.random_zoom:
-            zoom_factor = np.random.uniform(0.5, 1.0)
+            zoom_factor = float(np.random.uniform(0.5, 1.0))
         else:
             zoom_factor = 1.0
 

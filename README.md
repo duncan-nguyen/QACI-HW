@@ -142,6 +142,7 @@ Cấu hình mặc định: **một GPU · 100.000 scene (~445k sample, 10% GA++)
 SKIP_TRAIN=1 SKIP_EVAL=1 bash script/run_paper_setting.sh
 
 # 2. đo num_workers trên chính máy đó -- GPU gần như không bao giờ là chỗ nghẽn
+#    (xem mục "Tối ưu tốc độ train" bên dưới: một sample đã từ 36,5 ms xuống 9,6 ms)
 python script/bench_loader.py --dataset-path data/grasp-anything-pp-full \
     --split-path split/grasp-anything-pp --workers 8,16,32,48,64
 
@@ -288,6 +289,36 @@ Những lỗi làm *sai số liệu* chứ không làm chương trình chết, p
 | A9 | `script/build_ga_pp_subset.py` ghi ảnh/label không atomic → đứt giữa chừng để lại file cụt mà lần chạy sau bỏ qua | `write_atomic()` qua file tạm + `os.replace` |
 | A10 | `script/diagnose_part_masks.py` (đo `part_mask` ở mức part hay mức object) bị gỡ khỏi branch này | Khôi phục từ branch `text-image-aware` |
 
+### Tối ưu tốc độ train
+
+Chỗ nghẽn là **CPU dataloader**, không phải GPU (GR-ConvNet chỉ 1,9M tham số). Một sample GA++
+đi từ **20,5 ms xuống 4,7 ms** trên một core — nhanh **4,3×**. Số đo lấy trên 16 core với
+`cv2.setNumThreads(0)`, ảnh 416×416×3 → 224×224, trung bình 3 lượt đo xen kẽ hai bản code.
+
+| | Chỗ | Trước | Sau | Sai khác so với bản cũ |
+|---|---|---|---|---|
+| P1 | `Image.resize` — `skimage.transform.resize` | 12,5 ms | **0,40 ms** | ≤ 1/255 trên 0,02-0,4% pixel (làm tròn float32). Tái tạo đúng hai bước của skimage bằng cv2: lọc Gauss `σ=(tỉ_lệ−1)/2` rồi bilinear. Hai chi tiết dễ sai: (a) tên chế độ biên không trùng nhau — skimage `reflect`→`BORDER_REFLECT_101`, `symmetric`→`BORDER_REFLECT`; (b) khi **phóng to**, hàng/cột ngoài cùng có lấy mẫu ngoài biên mà `cv2.resize` luôn nhân bản biên → lệch tới **13/255** ở khung viền, nên đường phóng to phải dùng `warpAffine` có `borderMode`. Đừng thay bằng `INTER_AREA`: lệch 0,74/255 mỗi pixel **và** chậm hơn (0,69 ms) |
+| P2 | `Image.rotate` ở góc bội 90° | 2,32 ms | **0,22 ms** | ≤ 1/255, theo hướng tốt hơn: `np.rot90` là hoán vị chỉ số nên *chính xác tuyệt đối*, còn skimage nội suy rồi làm tròn. Góc bất kỳ → `cv2.warpAffine` (≤ 1/255) |
+| P3 | `Image.from_file` — `imageio.imread` | 1,94 ms | **1,51 ms** | Không có (đối chiếu trên JPEG: giống hệt). `cv2.imread` trả `None` khi lỗi thay vì ném exception, nên bọc thêm `FileNotFoundError` — không thì train âm thầm trên ảnh đen |
+| P4 | `GraspRectangles.draw` — `skimage.draw.polygon` từng rect | 2,24 ms | **0,25 ms** | **2,2% diện tích `pos`.** Hình học được vector hoá (chính xác), nhưng `cv2.fillConvexPoly` tô cả pixel mà cạnh đi qua còn skimage chỉ lấy pixel có *tâm* bên trong; thu rect vào 0,5 px để bù, còn lệch 2,2% diện tích và 0,2% pixel đổi rect thắng ở `ang`/`width`. **Đây là thay đổi duy nhất đụng vào nhãn train** |
+| P5 | 5-7 lần `.item()` mỗi step trong vòng train | mỗi lần chặn CPU tới khi GPU chạy xong hàng đợi | `LossMeter` cộng dồn trên GPU (float64), đồng bộ 1 lần/epoch | Không có |
+| P6 | Tokenize CLIP trong tiến trình chính | 6,3 ms/batch nằm trên đường găng | `PromptTokenizer` chạy trong DataLoader worker (0,042 ms/sample) | Không có — cùng tokenizer, cùng `max_length` |
+| P7 | `validate()` cố định `batch_size=1` | forward 1 ảnh mỗi lần | `--val-batch-size` (mặc định 32); post-process và IoU vẫn chạy từng sample | Không có — đã kiểm ở bs 1/5/N: `correct`/`failed` giống hệt, loss lệch < 1e-8 |
+| P8 | Không có AMP / channels_last / `cudnn.benchmark` | fp32, NCHW | `--amp auto` (bf16 nếu GPU hỗ trợ), `--channels-last auto`, `--cudnn-benchmark`, `--tf32` | **Có, đáng kể.** `--amp off` để quay về fp32 thuần |
+| P9 | `rot` bị `default_collate` ép về float32 khi phần tử đầu batch là `0` (int) | mất 8 chữ số của các góc khác trong batch | `float(random.choice(...))` trong `GraspDatasetBase.__getitem__` | Sửa lỗi. Không lộ ra khi `batch_size=1`, nhưng làm `validate` dựng GT bằng góc khác góc đã xoay ảnh |
+
+Sau khi sửa, phần tốn nhất còn lại của một sample là giải mã JPEG (1,5 ms) — muốn giảm nữa thì
+phải đổi định dạng dữ liệu trên đĩa, không phải đổi code.
+
+Kiểm tra lại các phép biến đổi này (không cần dataset, không cần GPU):
+
+```bash
+python script/smoke_test_loader.py
+```
+
+Muốn tái lập đúng số liệu của các run cũ: đặt `AMP=off` và hoàn nguyên P4 (hunk `draw` trong
+`utils/dataset_processing/grasp.py`). Các mục còn lại chỉ khác ở mức làm tròn, hoặc chính xác
+hơn bản cũ.
 
 ## Acknowledgement
 Our codebase is developed based on [Kumra et al.](https://github.com/skumra/robotic-grasping).

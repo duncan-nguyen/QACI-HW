@@ -117,6 +117,23 @@ class CLIPTextEncoder(nn.Module):
         self.model.eval()
         return self
 
+    def _tokenize(self, prompts):
+        """
+        Nhận cả hai dạng prompt:
+
+        * `list[str]` -- tokenize tại chỗ, như trước.
+        * `dict` có `input_ids`/`attention_mask` -- đã tokenize sẵn trong DataLoader worker
+          (xem `PromptTokenizer`). Tokenize 64 prompt tốn 6,3 ms; chạy trong tiến trình chính
+          thì 6,3 ms đó nằm thẳng trên đường găng của mỗi step, chia về worker thì mất hẳn.
+
+        :return: dict[str, Tensor] hai key input_ids / attention_mask
+        """
+        if isinstance(prompts, dict):
+            return {'input_ids': prompts['input_ids'],
+                    'attention_mask': prompts['attention_mask']}
+        return self.tokenizer(list(prompts), padding='max_length', truncation=True,
+                              max_length=self.max_length, return_tensors='pt')
+
     def token_strings(self, prompts):
         """
         Chuỗi token thật sự đưa vào encoder, để gán nhãn cho hình alignment.
@@ -124,24 +141,25 @@ class CLIPTextEncoder(nn.Module):
         :return: list[list[str]] cùng chiều dài với chiều L của forward() (kể cả SOT/EOT/pad,
                  dùng chung mask với forward để lọc).
         """
-        tok = self.tokenizer(list(prompts), padding='max_length', truncation=True,
-                             max_length=self.max_length)
-        return [[self.tokenizer.convert_ids_to_tokens(i) for i in ids]
-                for ids in tok['input_ids']]
+        ids = self._tokenize(prompts)['input_ids']
+        if torch.is_tensor(ids):
+            ids = ids.tolist()
+        return [[self.tokenizer.convert_ids_to_tokens(i) for i in seq] for seq in ids]
 
     @torch.no_grad()
     def forward(self, prompts):
         """
-        :param prompts: list[str] độ dài B
+        :param prompts: list[str] độ dài B, hoặc dict đã tokenize sẵn (xem `_tokenize`)
         :return: (B, L, D) embedding từng token, (B, L) mask bool của token nội dung
         """
         device = next(self.model.parameters()).device
-        tok = self.tokenizer(list(prompts), padding='max_length', truncation=True,
-                             max_length=self.max_length, return_tensors='pt').to(device)
+        tok = {k: v.to(device, non_blocking=True) for k, v in self._tokenize(prompts).items()}
         out = self.model.text_model(**tok).last_hidden_state          # (B, L, hidden)
         emb = self.model.text_projection(out)                         # (B, L, D)
 
         ids = tok['input_ids']
+        # `.bool()` đã tạo tensor mới nên các phép ghi đè bên dưới không đụng vào attention_mask
+        # gốc -- quan trọng khi tensor đó đến từ DataLoader và còn được dùng lại ở chỗ khác.
         mask = tok['attention_mask'].bool()
         # Bỏ SOT (luôn ở vị trí 0) và EOT (token cuối cùng còn attend được).
         mask[:, 0] = False
@@ -150,6 +168,32 @@ class CLIPTextEncoder(nn.Module):
         if self.drop_punctuation:
             mask &= self.is_content.to(device)[ids]
         return emb, mask
+
+
+class PromptTokenizer:
+    """
+    Tokenize prompt *trong DataLoader worker* thay vì trong tiến trình chính.
+
+    Dataset gọi object này cho từng sample; `default_collate` gộp các tensor 1 chiều thành
+    (B, L), và `CLIPTextEncoder._tokenize` nhận thẳng dict đó. Kết quả token giống hệt đường
+    cũ -- cùng tokenizer, cùng `padding='max_length'`, cùng `max_length`.
+
+    Phải picklable để `num_workers > 0` gửi được sang worker; `CLIPTokenizerFast` thoả mãn.
+    """
+
+    def __init__(self, model_name=CLIP_MODEL, max_length=MAX_PROMPT_TOKENS):
+        from transformers import CLIPTokenizerFast
+        from transformers import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+        self.max_length = max_length
+        self.tokenizer = CLIPTokenizerFast.from_pretrained(model_name)
+
+    def __call__(self, prompt):
+        tok = self.tokenizer(prompt, padding='max_length', truncation=True,
+                             max_length=self.max_length, return_tensors='pt')
+        return {'input_ids': tok['input_ids'][0],
+                'attention_mask': tok['attention_mask'][0]}
 
 
 class TokenRegionAlignment(nn.Module):

@@ -50,6 +50,7 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         include_mask=True,
         include_union=False,
         split_path=None,
+        prompt_tokenizer=None,
         **kwargs,
     ):
         """
@@ -64,11 +65,16 @@ class GraspAnythingPPDataset(GraspDatasetBase):
                               lại grasp của *mọi* part cùng object (~4,4 lần công việc) cho
                               một target không ai dùng. Bật lại nếu cần cho phân tích.
         :param split_path: Thư mục split tự chọn; mặc định dò theo SPLIT_DIRS.
+        :param prompt_tokenizer: callable str -> dict tensor (`PromptTokenizer`). Có thì prompt
+                                 được tokenize ngay trong worker và `extra["prompt"]` trả về
+                                 dict thay vì str -- gỡ 6,3 ms/batch khỏi tiến trình chính.
+                                 None = trả str như cũ.
         :param kwargs: kwargs của GraspDatasetBase.
         """
         super().__init__(seen=seen, **kwargs)
 
         self.file_path = file_path
+        self.prompt_tokenizer = prompt_tokenizer
         self.include_prompt = include_prompt
         self.include_mask = include_mask
         self.include_union = include_union
@@ -368,6 +374,11 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         extra = {}
         if self.include_prompt:
             extra["prompt"] = self.get_prompt(idx)
+            # Tokenize ở đây = tokenize trong worker. `default_collate` gộp dict tensor thành
+            # (B, L) và `CLIPTextEncoder` nhận thẳng. Chuỗi gốc vẫn giữ ở key "prompt" vì
+            # utils/visualisation/alignment.py và evaluate.py đọc nó dưới dạng str.
+            if self.prompt_tokenizer is not None:
+                extra["prompt_tokens"] = self.prompt_tokenizer(extra["prompt"])
         if self.include_mask:
             extra["part_mask"] = self.numpy_to_torch(
                 self.get_part_mask(idx, rot, zoom_factor)

@@ -61,7 +61,11 @@ EPOCHS=${EPOCHS:-50}                  # 50 x 2000 x 64 = 6,4M lượt sample
 BATCHES_PER_EPOCH=${BATCHES_PER_EPOCH:-2000}
 BATCH_SIZE=${BATCH_SIZE:-64}
 INPUT_SIZE=${INPUT_SIZE:-224}
-VAL_SPLIT=${VAL_SPLIT:-0.998}         # validate chạy batch_size=1 nên giữ tập val nhỏ
+VAL_SPLIT=${VAL_SPLIT:-0.998}         # tỉ lệ dev set dùng để train; phần còn lại là val
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}  # validate đã batch hoá (bản cũ cố định 1)
+AMP=${AMP:-auto}                      # auto = bf16 nếu GPU hỗ trợ. off = fp32 như các run cũ
+CHANNELS_LAST=${CHANNELS_LAST:-auto}
+TOKENIZE_IN_LOADER=${TOKENIZE_IN_LOADER:-1}
 LR=${LR:-1e-3}
 LR_SCHEDULE=${LR_SCHEDULE:-cosine}
 USE_TEXT=${USE_TEXT:-1}
@@ -181,7 +185,8 @@ else
         "align_stage=$ALIGN_STAGE" "warmup_epochs=$WARMUP_EPOCHS" \
         "diag_interval=$DIAG_INTERVAL" "probe_samples=$PROBE_SAMPLES" \
         "counterfactual_every=$COUNTERFACTUAL_EVERY" \
-        "num_workers=$NUM_WORKERS" \
+        "num_workers=$NUM_WORKERS" "val_batch_size=$VAL_BATCH_SIZE" \
+        "amp=$AMP" "channels_last=$CHANNELS_LAST" \
         "budget_samples=$(( EPOCHS * BATCHES_PER_EPOCH * BATCH_SIZE ))" \
         > "$RUN_RESULTS/config.txt"
     "$PYTHON" train_network.py \
@@ -195,7 +200,10 @@ else
         --epochs "$EPOCHS" \
         --batches-per-epoch "$BATCHES_PER_EPOCH" \
         --batch-size "$BATCH_SIZE" \
+        --val-batch-size "$VAL_BATCH_SIZE" \
         --num-workers "$NUM_WORKERS" \
+        --tokenize-in-loader "$TOKENIZE_IN_LOADER" \
+        --amp "$AMP" --channels-last "$CHANNELS_LAST" \
         --lr "$LR" --lr-schedule "$LR_SCHEDULE" \
         --use-text "$USE_TEXT" \
         --w-align "$W_ALIGN" \

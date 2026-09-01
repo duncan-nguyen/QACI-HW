@@ -1,9 +1,15 @@
 import argparse
 import contextlib
 import datetime
+import inspect
 import json
 import logging
 import os
+
+# Tokenizer "fast" của HuggingFace mở thread pool Rust; DataLoader fork worker sau đó thì
+# tokenizers in cảnh báo và có thể treo. Ta tokenize *trong* worker nên không cần song song
+# trong tiến trình chính. Phải đặt trước khi transformers được import.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import cv2
 import tensorboardX
@@ -178,9 +184,52 @@ def parse_args():
         help="Shift the start point of the dataset to use a different test/train split",
     )
     parser.add_argument("--num-workers", type=int, default=8, help="Dataset workers")
+    parser.add_argument(
+        "--tokenize-in-loader",
+        type=int,
+        default=1,
+        help="Tokenize prompt trong DataLoader worker thay vì tiến trình chính (1/0). "
+        "Tokenize 64 prompt tốn 6,3 ms và nằm thẳng trên đường găng của mỗi step.",
+    )
 
     # Training
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=32,
+        help="Batch size lúc validate. Bản cũ cố định 1, tức forward 1 ảnh một lần trên GPU. "
+        "Kết quả không đổi (post-process và IoU vẫn tính từng sample một).",
+    )
+    parser.add_argument(
+        "--amp",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "bf16", "fp16"],
+        help="Mixed precision. 'auto' = bf16 nếu GPU hỗ trợ, ngược lại tắt. 'fp16' kèm "
+        "GradScaler. CHÚ Ý: bật AMP làm số liệu khác bản fp32 thuần -- ghi rõ khi báo cáo.",
+    )
+    parser.add_argument(
+        "--channels-last",
+        type=str,
+        default="auto",
+        choices=["auto", "0", "1"],
+        help="Bố cục NHWC cho conv. 'auto' = bật khi AMP đang bật trên CUDA (không có "
+        "tensor core thì NHWC thường chậm hơn).",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        type=int,
+        default=1,
+        help="Cho cuDNN dò thuật toán conv nhanh nhất. Input size cố định nên chỉ tốn vài "
+        "batch đầu rồi lời mãi.",
+    )
+    parser.add_argument(
+        "--tf32",
+        type=int,
+        default=1,
+        help="Cho phép TF32 trong matmul/cuDNN trên Ampere trở lên.",
+    )
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     parser.add_argument(
         "--lr-schedule",
@@ -236,6 +285,72 @@ def parse_args():
     return args
 
 
+def resolve_amp(mode, device):
+    """
+    Kiểu dữ liệu cho autocast, hoặc None nếu chạy fp32 thuần.
+
+    'auto' chỉ chọn bf16 -- bf16 có cùng dải mũ với fp32 nên không cần loss scaling và không
+    tràn số; fp16 nhanh tương đương nhưng phải kèm GradScaler và có thể mất ổn định, nên chỉ
+    bật khi người dùng gọi tên nó ra.
+    """
+    if mode == "off" or device.type != "cuda":
+        return None
+    if mode == "bf16":
+        return torch.bfloat16
+    if mode == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else None
+
+
+def autocast_ctx(device, amp_dtype):
+    if amp_dtype is None:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+
+def to_device(x, device, channels_last=False):
+    """
+    `non_blocking=True` chỉ có tác dụng khi bộ nhớ nguồn đã pinned -- DataLoader đang bật
+    `pin_memory`, nên copy H2D chồng lấn được với phần tính toán của batch trước.
+    """
+    x = x.to(device, non_blocking=True)
+    if channels_last and x.dim() == 4:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x
+
+
+class LossMeter:
+    """
+    Cộng dồn loss *trên GPU*, chỉ đồng bộ một lần lúc kết thúc epoch.
+
+    Bản cũ gọi `.item()` cho tổng loss và cho từng thành phần ngay trong vòng lặp: 5-7 lần
+    `cudaStreamSynchronize` mỗi batch, mỗi lần chặn CPU cho tới khi toàn bộ hàng đợi kernel
+    chạy xong -- đúng thứ phá vỡ việc chồng lấn giữa nạp dữ liệu và tính toán.
+
+    Cộng dồn ở float64 để giữ nguyên độ chính xác của phép cộng Python cũ (quan trọng khi
+    autocast bật, vì loss lúc đó là bf16/fp16).
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.total = torch.zeros((), dtype=torch.float64, device=device)
+        self.parts = {}
+        self.weight = 0.0
+
+    def update(self, loss, losses, weight=1.0):
+        self.total += loss.detach().double() * weight
+        for name, value in losses.items():
+            if name not in self.parts:
+                self.parts[name] = torch.zeros((), dtype=torch.float64, device=self.device)
+            self.parts[name] += value.detach().double() * weight
+        self.weight += weight
+
+    def result(self):
+        denominator = self.weight if self.weight else 1.0
+        return (float(self.total) / denominator,
+                {name: float(value) / denominator for name, value in self.parts.items()})
+
+
 def batch_extras(net, batch, device):
     """
     Lấy prompt / part_mask ở phần tử thứ 6 của batch (chỉ Grasp-Anything++ có).
@@ -245,16 +360,29 @@ def batch_extras(net, batch, device):
         return {}
     extra = batch[5]
     kwargs = {}
-    if "prompt" in extra:
+    if "prompt_tokens" in extra:
+        # Loader đã tokenize trong worker -> đưa thẳng tensor cho CLIPTextEncoder (nó tự
+        # chuyển sang device). Key "prompt" vẫn là chuỗi gốc, dành cho phần vẽ hình.
+        kwargs["prompts"] = extra["prompt_tokens"]
+    elif "prompt" in extra:
         kwargs["prompts"] = extra["prompt"]
     if "part_mask" in extra:
-        kwargs["part_mask"] = extra["part_mask"].to(device)
+        kwargs["part_mask"] = extra["part_mask"].to(device, non_blocking=True)
     return kwargs
 
 
-def validate(net, device, val_data, iou_threshold, diagnostics=False):
+def validate(net, device, val_data, iou_threshold, diagnostics=False,
+             amp_dtype=None, channels_last=False):
     """
     Run validation.
+
+    Batch hoá được (`--val-batch-size`): forward chạy theo lô, còn post-process và IoU vẫn
+    tính *từng sample một* trên đúng lát cắt `[i:i+1]` -- `post_process_output` lọc gaussian
+    2 chiều, đưa cả lô vào thì nó sẽ làm mờ xuyên qua chiều batch. Nhờ giữ lát cắt trên GPU
+    (chứ không gom về CPU rồi cắt) mà con số ra giống hệt bản batch_size=1 khi tắt AMP.
+
+    Mọi đại lượng trung bình đều nhân trọng số theo *số sample* của lô, nên lô cuối lẻ không
+    kéo lệch kết quả.
 
     :param net: Network
     :param device: Torch device
@@ -262,6 +390,8 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False):
     :param iou_threshold: IoU threshold
     :param diagnostics: gom thêm chất lượng alignment + phân bố token (utils/diagnostics.py).
                         Chỉ có ý nghĩa với model có nhánh ngôn ngữ.
+    :param amp_dtype: kiểu autocast, None = fp32
+    :param channels_last: đưa input về NHWC
     :return: Successes, Failures and Losses
     """
     net.eval()
@@ -269,7 +399,7 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False):
     results = {"correct": 0, "failed": 0, "loss": 0, "losses": {}, "align": {}, "token": {},
                "tally": TokenTally()}
 
-    ld = len(val_data)
+    meter = LossMeter(device)
     collect = diagnostics and getattr(net, "use_text", False)
     n_align = 0
 
@@ -277,54 +407,56 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False):
         for batch in val_data:
             # GA++ trả thêm phần tử thứ 6 (prompt / part_mask); các dataset khác trả đúng 5.
             x, y, didx, rot, zoom_factor = batch[:5]
-            xc = x.to(device)
-            yc = [yy.to(device) for yy in y]
+            batch_size = x.shape[0]
+            xc = to_device(x, device, channels_last)
+            yc = [to_device(yy, device) for yy in y]
             extras = batch_extras(net, batch, device)
-            lossd = net.compute_loss(xc, yc, **extras)
+            with autocast_ctx(device, amp_dtype):
+                lossd = net.compute_loss(xc, yc, **extras)
 
-            loss = lossd["loss"]
-
-            results["loss"] += loss.item() / ld
-            for ln, l in lossd["losses"].items():
-                if ln not in results["losses"]:
-                    results["losses"][ln] = 0
-                results["losses"][ln] += l.item() / ld
+            meter.update(lossd["loss"], lossd["losses"], weight=batch_size)
 
             if collect and lossd.get("align_logits") is not None and "part_mask" in extras:
                 # Đo trên *toàn bộ* val, không phải trên probe set: hai thứ này trả lời câu
                 # "vùng chọn có đúng không" nên cần thống kê chứ không cần ví dụ đẹp.
-                n_align += 1
+                n_align += batch_size
                 for k, v in align_stats(lossd["align_logits"], extras["part_mask"]).items():
-                    results["align"][k] = results["align"].get(k, 0.0) + v
+                    results["align"][k] = results["align"].get(k, 0.0) + v * batch_size
                 stats = lossd.get("stats", {})
                 for k, v in stats.items():
                     if k.startswith("token/") or k.startswith("fusion/"):
-                        results["token"][k] = results["token"].get(k, 0.0) + v
+                        results["token"][k] = results["token"].get(k, 0.0) + v * batch_size
                 if "_winning_tokens" in stats and "prompts" in extras:
                     results["tally"].update(stats["_winning_tokens"], stats["_text_mask"],
                                             net.text_encoder.token_strings(extras["prompts"]))
 
-            q_out, ang_out, w_out = post_process_output(
-                lossd["pred"]["pos"],
-                lossd["pred"]["cos"],
-                lossd["pred"]["sin"],
-                lossd["pred"]["width"],
-            )
+            pred = lossd["pred"]
+            for i in range(batch_size):
+                # `.float()` là no-op khi tắt AMP; bật bf16 thì bắt buộc vì numpy không có
+                # kiểu bfloat16.
+                q_out, ang_out, w_out = post_process_output(
+                    pred["pos"][i:i + 1].float(),
+                    pred["cos"][i:i + 1].float(),
+                    pred["sin"][i:i + 1].float(),
+                    pred["width"][i:i + 1].float(),
+                )
 
-            s = evaluation.calculate_iou_match(
-                q_out,
-                ang_out,
-                val_data.dataset.get_gtbb(didx, rot, zoom_factor),
-                no_grasps=1,
-                grasp_width=w_out,
-                threshold=iou_threshold,
-            )
+                s = evaluation.calculate_iou_match(
+                    q_out,
+                    ang_out,
+                    val_data.dataset.get_gtbb(int(didx[i]), float(rot[i]),
+                                              float(zoom_factor[i])),
+                    no_grasps=1,
+                    grasp_width=w_out,
+                    threshold=iou_threshold,
+                )
 
-            if s:
-                results["correct"] += 1
-            else:
-                results["failed"] += 1
+                if s:
+                    results["correct"] += 1
+                else:
+                    results["failed"] += 1
 
+    results["loss"], results["losses"] = meter.result()
     for group in ("align", "token"):
         results[group] = {k: v / n_align for k, v in results[group].items()} if n_align else {}
     results["accuracy"] = results["correct"] / max(1, results["correct"] + results["failed"])
@@ -332,7 +464,7 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False):
 
 
 def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=False,
-          tb=None, diag_interval=0):
+          tb=None, diag_interval=0, amp_dtype=None, scaler=None, channels_last=False):
     """
     Run one training epoch
     :param epoch: Current epoch
@@ -346,9 +478,13 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
     :param diag_interval: cứ mỗi bấy nhiêu batch thì đo một lần. 0 = tắt. Đo mỗi bước là phí:
                           entropy + argmax trên (B, L, H, W) và grad_norm_split tốn thêm hai
                           lượt backward.
+    :param amp_dtype: kiểu autocast (None = fp32)
+    :param scaler: GradScaler, chỉ bật thật khi amp_dtype là fp16
+    :param channels_last: đưa input về NHWC
     :return:  Average Losses for Epoch
     """
     results = {"loss": 0, "losses": {}}
+    meter = LossMeter(device)
 
     net.train()
 
@@ -368,31 +504,38 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             diag = (diag_interval and tb is not None and batch_idx % diag_interval == 0
                     and getattr(net, "use_text", False))
 
-            xc = x.to(device)
-            yc = [yy.to(device) for yy in y]
+            xc = to_device(x, device, channels_last)
+            yc = [to_device(yy, device) for yy in y]
             with net.collecting_stats() if diag else contextlib.nullcontext():
-                lossd = net.compute_loss(xc, yc, **extras)
+                with autocast_ctx(device, amp_dtype):
+                    lossd = net.compute_loss(xc, yc, **extras)
 
             loss = lossd["loss"]
 
             if batch_idx % 100 == 0:
+                # `.item()` ở đây đồng bộ GPU, nên chỉ gọi mỗi 100 batch. Phần cộng dồn loss
+                # thì để LossMeter giữ trên GPU tới cuối epoch.
                 logging.info(
                     f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item():0.4f}"
                 )
 
-            results["loss"] += loss.item()
-            for ln, l in lossd["losses"].items():
-                if ln not in results["losses"]:
-                    results["losses"][ln] = 0
-                results["losses"][ln] += l.item()
+            meter.update(loss, lossd["losses"])
 
-            optimizer.zero_grad()
-            loss.backward()
-
-            if diag:
-                log_step_diagnostics(tb, net, lossd, step, xc, yc, extras)
-
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+                if diag:
+                    # grad_norms đọc thẳng `.grad`, mà lúc này gradient còn nhân hệ số scale
+                    # của fp16 -> phải gỡ scale trước khi đo, nếu không con số vô nghĩa.
+                    scaler.unscale_(optimizer)
+                    log_step_diagnostics(tb, net, lossd, step, xc, yc, extras)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if diag:
+                    log_step_diagnostics(tb, net, lossd, step, xc, yc, extras)
+                optimizer.step()
 
             # Display the images
             if vis:
@@ -404,7 +547,7 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
                         + [yi[idx,].numpy().squeeze() for yi in y]
                         + [x[idx,].numpy().squeeze()]
                         + [
-                            pc[idx,].detach().cpu().numpy().squeeze()
+                            pc[idx,].detach().float().cpu().numpy().squeeze()
                             for pc in lossd["pred"].values()
                         ]
                     )
@@ -425,9 +568,7 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
                 )
                 cv2.waitKey(2)
 
-    results["loss"] /= batch_idx
-    for l in results["losses"]:
-        results["losses"][l] /= batch_idx
+    results["loss"], results["losses"] = meter.result()
 
     return results
 
@@ -492,7 +633,8 @@ def log_epoch(tb, epoch, train_results, val_results, lr, lambda_align):
                      + ", ".join(f"{t} {p:.1%}" for t, p in tally.top(5)))
 
 
-def log_counterfactual(tb, net, device, loaders, epoch, iou_threshold):
+def log_counterfactual(tb, net, device, loaders, epoch, iou_threshold,
+                       amp_dtype=None, channels_last=False):
     """
     Đối chứng: prompt đúng / prompt hoán vị / một prompt cố định cho mọi ảnh.
 
@@ -503,7 +645,8 @@ def log_counterfactual(tb, net, device, loaders, epoch, iou_threshold):
     for name, loader in loaders.items():
         if loader is None:
             continue
-        scores[name] = validate(net, device, loader, iou_threshold)["accuracy"]
+        scores[name] = validate(net, device, loader, iou_threshold, amp_dtype=amp_dtype,
+                                channels_last=channels_last)["accuracy"]
         tb.add_scalar(f"counterfactual/{name}_success", scores[name], epoch)
 
     if "normal" in scores and "shuffled" in scores:
@@ -611,6 +754,31 @@ def run():
     # Get the compute device
     device = get_device(args.force_cpu)
 
+    # Cấu hình backend. Input size cố định suốt run nên `cudnn.benchmark` chỉ dò thuật toán ở
+    # vài batch đầu rồi dùng lại mãi; nếu shape thay đổi liên tục thì cờ này lại phản tác dụng.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+        if args.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    amp_dtype = resolve_amp(args.amp, device)
+    # fp16 cần GradScaler; bf16 thì không (cùng dải mũ với fp32). GradScaler tạo sẵn nhưng
+    # `enabled=False` để nhánh code phía dưới không phải rẽ hai lần.
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is torch.float16)
+    if args.channels_last == "auto":
+        channels_last = amp_dtype is not None and device.type == "cuda"
+    else:
+        channels_last = bool(int(args.channels_last))
+    logging.info("Precision: %s | channels_last=%s | cudnn.benchmark=%s",
+                 "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
+                 channels_last, torch.backends.cudnn.benchmark)
+    if amp_dtype is not None:
+        logging.warning(
+            "AMP đang BẬT: loss và accuracy sẽ lệch nhẹ so với run fp32 thuần. Ghi rõ điều "
+            "này khi so bảng với các run cũ (giá trị nằm trong commandline_args.json)."
+        )
+
     # Load Dataset
     logging.info(f"Loading {args.dataset.title()} Dataset...")
     Dataset = get_dataset(args.dataset)
@@ -626,6 +794,21 @@ def run():
     # Chỉ truyền khi có, vì các loader khác (cornell/jacquard/...) không nhận kwarg này.
     if args.split_path:
         ds_kwargs["split_path"] = args.split_path
+
+    # Tokenizer phải gắn vào dataset *trước* khi dựng DataLoader: với persistent_workers,
+    # worker đã fork rồi thì gán thêm thuộc tính ở tiến trình chính không lan sang được (cùng
+    # cái bẫy đã ghi ở phần counterfactual bên dưới).
+    if (args.use_text and args.tokenize_in_loader and args.num_workers > 0
+            and "prompt_tokenizer" in inspect.signature(Dataset.__init__).parameters):
+        try:
+            from inference.models.grconvnet3_align import PromptTokenizer
+
+            ds_kwargs["prompt_tokenizer"] = PromptTokenizer()
+            logging.info("Tokenize prompt trong DataLoader worker.")
+        except Exception as exc:      # thiếu transformers / không tải được checkpoint CLIP
+            logging.warning("Không dựng được PromptTokenizer (%s); tokenize trong tiến "
+                            "trình chính như cũ.", exc)
+
     dataset = Dataset(args.dataset_path, **ds_kwargs)
     # Validation phải chạy trên dữ liệu *không* augmentation: xem GraspDatasetBase.eval_view().
     val_dataset = dataset.eval_view()
@@ -674,7 +857,7 @@ def run():
         **loader_kwargs,
     )
     val_data = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1, sampler=val_sampler, **loader_kwargs
+        val_dataset, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs
     )
 
     # Loader đối chứng phải dựng *ở đây*: với persistent_workers, đổi thuộc tính dataset ở
@@ -685,9 +868,9 @@ def run():
         shuffled = val_dataset.eval_view().shuffle_prompts(seed=args.random_seed)
         fixed = val_dataset.eval_view().set_fixed_prompt(args.fixed_prompt)
         counterfactual_loaders["shuffled"] = torch.utils.data.DataLoader(
-            shuffled, batch_size=1, sampler=val_sampler, **loader_kwargs)
+            shuffled, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs)
         counterfactual_loaders["fixed"] = torch.utils.data.DataLoader(
-            fixed, batch_size=1, sampler=val_sampler, **loader_kwargs)
+            fixed, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs)
     logging.info("Done")
 
     # Load the network
@@ -712,6 +895,8 @@ def run():
     net = network(**net_kwargs)
 
     net = net.to(device)
+    if channels_last:
+        net = net.to(memory_format=torch.channels_last)
     logging.info("Done")
 
     # CLIP text encoder bị đóng băng -> lọc ra khỏi optimizer cho gọn.
@@ -765,11 +950,15 @@ def run():
             vis=args.vis,
             tb=tb,
             diag_interval=args.diag_interval,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            channels_last=channels_last,
         )
 
         # Run Validation
         logging.info("Validating...")
-        test_results = validate(net, device, val_data, args.iou_threshold, diagnostics=True)
+        test_results = validate(net, device, val_data, args.iou_threshold, diagnostics=True,
+                                amp_dtype=amp_dtype, channels_last=channels_last)
         iou = test_results["accuracy"]
         logging.info("%d/%d = %f" % (test_results["correct"],
                                      test_results["correct"] + test_results["failed"], iou))
@@ -782,7 +971,8 @@ def run():
 
         if args.counterfactual_every and (epoch + 1) % args.counterfactual_every == 0:
             log_counterfactual(tb, net, device, counterfactual_loaders, epoch,
-                               args.iou_threshold)
+                               args.iou_threshold, amp_dtype=amp_dtype,
+                               channels_last=channels_last)
 
         # Save best performing network
         # `best_iou` chỉ được cập nhật khi thật sự tốt hơn. Bản cũ đặt nó bên trong nhánh
@@ -811,7 +1001,8 @@ def run():
     # đúng epoch cuối: đây là con số đi vào báo cáo.
     if args.counterfactual_every:
         log_counterfactual(tb, net, device, counterfactual_loaders, args.epochs - 1,
-                           args.iou_threshold)
+                           args.iou_threshold, amp_dtype=amp_dtype,
+                           channels_last=channels_last)
     tb.flush()
 
 
