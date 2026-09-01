@@ -71,21 +71,11 @@ và toàn bộ thiết kế dưới đây làm việc ở mức part.
 
 ## 2. Ý tưởng
 
-Tách hai câu hỏi và supervise bằng **hai loại nhãn khác hẳn nhau**:
+**Tăng độ liên quan giữa token quan trọng và vùng quan trọng.**
 
-| Nhánh | Trả lời | Target | Lấy từ |
-|---|---|---|---|
-| `Q_g` (geometry) | grasp *thế nào* | `M_∪` — hợp grasp của **mọi part** của object | union grasp label của object |
-| `A_T` (language) | grasp *chỗ nào* | `part_mask` của part được prompt nhắc | `part_mask/*.npy` |
-| `Q_T` (output) | kết quả | grasp rectangle của part đó | `grasp_label_positive` |
-
-Điểm mấu chốt: `A_T` được supervise bằng **segmentation mask**, còn `Q` bằng **grasp
-rectangle**. Hai nhãn khác loại → decoupling là thật.
-
-Nếu supervise `A_T` bằng chính grasp rectangle đã rasterize thì `L_align` chỉ là bản sao
-của `L_pos` (target của `Q` cũng chính là rectangle rasterize, xem
-`utils/dataset_processing/grasp.py:252-259`), và "decouple WHAT/HOW" thành khẩu hiệu rỗng.
-`part_mask/` của GA++ tránh được đúng cái bẫy đó.
+Mô hình tính relevance giữa mọi token và mọi pixel, rồi soft-select token phù hợp tại từng
+vùng. Không cần trích target phrase. Alignment map được supervise bằng `part_mask`; grasp
+decoder nhận cả vùng quan trọng lẫn text feature tương ứng với vùng đó.
 
 ## 3. Kiến trúc
 
@@ -94,10 +84,16 @@ Prompt ──► CLIP text encoder ──► token embeddings [t_1..t_L]
                                         │
 Image ──► GR-Conv encoder ──► F ────────┤
                                         ▼
-                          token-pixel alignment
-                          A_T(x,y) = σ( max_j cos(W_v F_xy, W_t t_j) / τ )
+                     token–region relevance S_xyj
+                                  │
+                     α_xyj = softmax_j(S_xyj / τ_t)
+                            ┌─────┴─────┐
+                            ▼           ▼
+                    region map A_T   region text R_T
+                            └─────┬─────┘
                                         │
-                          F' = F ⊙ (1 + A_T)      ◄── residual gating
+                         residual feature fusion
+                  F' = F + φ([F, F ⊙ A_T, R_T])
                                         │
                               GR-Conv decoder
                                         │
@@ -105,36 +101,32 @@ Image ──► GR-Conv encoder ──► F ────────┤
                            Q_T    cos2θ   sin2θ    W
 ```
 
-**Fuse ở feature level, không phải output level.** Prompt là part-level — handle và vành
-cốc khác cả angle lẫn width, nên cả 4 head đều phải được condition. Chỉ nhân `A_T` vào `Q`
-là ablation, không phải method.
+Với pixel `p=(x,y)`:
 
-Residual gating `(1 + A_T)` thay vì `A_T` để tránh gradient triệt tiêu khi `A_T ≈ 0` lúc
-đầu training. Kèm warmup λ từ 0.
+```
+S_pj = cos(W_v F_p, W_t t_j) / τ
+α_pj = softmax_j(S_pj / τ_t)           # token quan trọng tại pixel p
+A_T(p) = σ(Σ_j α_pj S_pj)              # vùng quan trọng
+R_T(p) = Σ_j α_pj W_r t_j              # text feature của vùng đó
+```
 
-Cài đặt: `inference/models/grconvnet3_align.py`, tên network `grconvnet3_align`. Gate đặt sau
-`res5` trước `conv4` nên cả 4 head đều được condition. Với `--input-size 224` thì `F` là
-56×56×128; `A_T` và `Q_g` được supervise ngay ở 56×56 — target hạ xuống bằng avg-pool, không
-upsample logits lên 224 để tạo độ chính xác giả.
+Loại SOT/EOT/padding/punctuation khỏi candidate tokens. Fuse trước decoder để prompt
+condition cả quality, angle và width. `A_T` supervise ở resolution thật của feature map.
+
+> **Trạng thái:** V2 đã implement trong `inference/models/grconvnet3_align.py`. V1 (hard `max`
+> + gate `F⊙(1+A_T)`) vẫn còn dưới dạng cờ `--align-mode hard --fusion gate` để làm một arm
+> của ablation; checkpoint V1 cũ vẫn load và chạy đúng như lúc train.
 
 ## 4. Loss
 
 ```
-L = L_grasp   (Q_T, cos2θ, sin2θ, W)    # loss GR-ConvNet gốc
-  + λ1 · L_agnostic(Q_g, M_∪)            # graspability, bất kể part nào
-  + λ2 · L_align   (A_T, part_mask)      # grounding: prompt → đúng part
+L = L_grasp(Q_T, cos2θ, sin2θ, W)
+  + λ · L_align(A_T, part_mask)
 ```
 
 `L_align` = BCE + Dice (Dice đỡ cho việc part_mask chỉ chiếm ~2–5% pixel). `τ` là temperature
-học được, khởi tạo 0.07 — bắt buộc, vì cosine ∈ [-1,1] không đủ dải cho BCE. `L_agnostic` là
-BCE. Cả hai tính trên logits (`BCEWithLogits`), không sigmoid trước.
-
-Cờ: `--w-align` (λ2), `--w-agnostic` (λ1), `--warmup-epochs` (warmup tuyến tính 0→1),
-`--use-text 0` để tắt hẳn nhánh ngôn ngữ. Đặt trọng số về 0 là bỏ hẳn loss phụ đó, không chỉ
-nhân 0 — dùng cho các arm ablation ở §6.
-
-Optional — contrastive dùng **`grasp_label_negative/`** làm hard negatives thật, thay cho
-in-batch negatives (vốn nhiều false negative vì rất nhiều prompt trùng nhau). Chưa cài.
+học được, khởi tạo 0.07. BCE tính trên logits; Dice tính sau sigmoid. Warmup `λ` trong vài
+epoch đầu. Bỏ `Q_g`, `M_∪` và `L_agnostic` để objective gọn và dễ ablate.
 
 ## 5. Đánh giá
 
@@ -154,24 +146,23 @@ nhánh ngôn ngữ đáng lẽ phải giúp: từ vựng part dùng chung giữa
 prompt thật: chỉ **197 part-phrase** khác nhau, `handle`/`cap`/`skin`/`stem`... lặp lại khắp
 nơi), còn danh từ object thì theo định nghĩa của split là không.
 
-> **Cảnh báo leak:** một scene có thể xuất hiện ở **cả** seen lẫn unseen — "unseen" nghĩa là
-> unseen *category*, không phải unseen *ảnh*. Khi dựng `M_∪` chỉ được union các label nằm
-> trong split đang train. `GraspAnythingPPDataset` gom `_files_by_object` **sau** khi lọc
-> split nên tự động đúng; đừng thay bằng glob thẳng trên đĩa.
-
 ## 6. Ablation
 
 Cùng một file `grconvnet3_align.py`, bật/tắt bằng cờ. Giữ **nguyên** ngân sách train giữa các
-arm (`--epochs × --batches-per-epoch × --batch-size`) và ghi rõ con số đó trong report — mặc
-định của repo (1000×50×8 = 400k sample) chỉ chạm ~9% của 4,4M, đó là subsample chứ không phải
-train hết.
+arm (`--epochs × --batches-per-epoch × --batch-size`) và ghi rõ con số đó trong report.
 
-| Arm | Cờ | text→spatial | L_align | Q_g union | Seen | Unseen | H |
-|---|---|---|---|---|---|---|---|
-| GR-ConvNet (no text) | `--use-text 0 --w-agnostic 0` | ✗ | ✗ | ✗ | | | |
-| + spatial attention | `--w-align 0 --w-agnostic 0` | ✓ | ✗ | ✗ | | | |
-| + align loss | `--w-agnostic 0` | ✓ | ✓ | ✗ | | | |
-| **Ours (full)** | mặc định | ✓ | ✓ | ✓ | | | |
+Cấu hình chạy: **một GPU · 100.000 scene (~445k sample, 10% GA++) · 50 epoch**, tức
+50 × 2000 × 64 = **6,4M lượt sample** mỗi arm ≈ 14 lượt qua subset. Đây là subsample của GA++,
+không phải train hết — và khác paper ở cả hai chiều (paper: 100% dữ liệu, 100 epoch), nên bảng
+dưới đây so *giữa các arm với nhau*, không so thẳng với Table 2. Bốn arm chạy tuần tự bằng
+`script/run_ablation.sh`.
+
+| Arm | Token–region | Region text | `L_align` | Seen | Unseen | H |
+|---|---|---|---|---|---|---|
+| GR-ConvNet (no text) | ✗ | ✗ | ✗ | | | |
+| Hard-max V1 | max | ✗ | ✓ | | | |
+| Soft alignment | softmax | ✗ | ✓ | | | |
+| **V2 full** | softmax | ✓ | ✓ | | | |
 
 Số tham chiếu từ Table 2 của paper (cùng split, cùng metric) — để đối chiếu, không phải để
 thắng: GR-ConvNet + CLIP `0.37 / 0.18 / 0.24` · CLIP-Fusion `0.40 / 0.29 / 0.33` ·
@@ -185,10 +176,9 @@ LGD `0.48 / 0.42 / 0.45`.
 - **LAVT / CLIPSeg / referring segmentation** — token-pixel alignment + auxiliary grounding
   loss là công thức chuẩn của nhánh này.
 
-Cái ta làm: một baseline **discriminative, một forward pass**, trong đó grounding part-level
-được supervise **tường minh** bằng `part_mask` thay vì để fusion module tự học ngầm. Nhãn của
-`A_T` (segmentation mask) khác loại với nhãn của `Q` (grasp rectangle) nên việc decouple
-WHAT/HOW là thật chứ không phải hai bản sao của cùng một supervision.
+Cái ta làm: một baseline **discriminative, một forward pass**. Mô hình học relevance
+token–region tường minh, soft-select token quan trọng tại từng vùng và đưa region-specific
+text feature vào grasp decoder.
 
 Phạm vi: đây là bài tập, không đặt mục tiêu vượt LGD. Kết quả cần có là bảng Seen/Unseen/H của
 bốn arm ở §6, đủ để thấy từng thành phần đóng góp gì.
@@ -203,14 +193,16 @@ bốn arm ở §6, đủ để thấy từng thành phần đóng góp gì.
   `get_depth()` raise thông báo rõ thay vì AttributeError.
 - `script/download_grasp_anything_pp.sh` — ảnh + `scene_description` + ba thư mục label GA++.
 - `notebooks/ga_pp_schema.ipynb` — verify schema qua HTTP range, dựng mini-subset.
-- `utils/data/grasp_anything_pp_data.py` — loader GA++: `grasp_instructions/`, `part_mask/`,
-  `M_∪`. `part_mask` chịu **đúng** chuỗi rotate→zoom→resize của ảnh (đo lệch tâm 0.00px trên 8
-  tổ hợp rot/zoom; control âm: nếu mask bỏ qua rot thì lệch 97–106px).
-- `inference/models/grconvnet3_align.py` — CLIP text (đóng băng, per-token) + `A_T` + gating +
-  hai loss phụ. `use_text=False` là baseline no-text dùng chung file, chung ngân sách train.
+- `utils/data/grasp_anything_pp_data.py` — loader GA++: `grasp_instructions/`, `part_mask/`.
+  `part_mask` chịu **đúng** chuỗi rotate→zoom→resize của ảnh (đo lệch tâm 0.00px trên 8
+  tổ hợp rot/zoom; control âm: nếu mask bỏ qua rot thì lệch 97–106px). `M_∪` vẫn dựng được
+  (`include_union=True`) nhưng mặc định tắt từ khi V2 bỏ `Q_g`.
+- `inference/models/grconvnet3_align.py` — V1: CLIP per-token + hard-max `A_T` + residual
+  gate + `Q_g`. `use_text=False` là baseline no-text. (V2 bên dưới thay phần lõi.)
 - `split/build_grasp_anything_pp.py`, `script/eval_grasp_anything_pp.sh`.
 - `train_network.py` / `evaluate.py` nhận batch 6 phần tử (tương thích ngược với 5), thêm
-  `--use-text --w-align --w-agnostic --warmup-epochs`.
+  `--use-text --w-align --warmup-epochs` (V2 thêm `--align-mode --region-text --fusion
+  --align-stage` và nhóm cờ chẩn đoán; `--w-agnostic` bỏ cùng với `Q_g`).
 
 **Sửa lỗi có sẵn (không sửa thì không chạy được trên môi trường mới):**
 
@@ -222,11 +214,31 @@ bốn arm ở §6, đủ để thấy từng thành phần đóng góp gì.
   xoay thành `(2,2,1)` → ValueError. Loader GA++ ép `float()`; **ba loader cũ (cornell,
   jacquard, grasp-anything) vẫn còn lỗi này**.
 
+**V2 — đã xong:**
+
+- `inference/models/grconvnet3_align.py` — soft token–region attention (`α_pj = softmax_j`),
+  `R_T`, residual fusion `F' = F + φ([F, F⊙A_T, R_T])` với conv cuối khởi tạo 0 (bước 0 đúng
+  bằng baseline). Bỏ hẳn `Q_g`/`L_agnostic`. Loại thêm token dấu câu khỏi candidate — hình
+  alignment của run V1 cho thấy `.` thường là token "mạnh nhất". Bốn arm của §6 bật/tắt bằng
+  cờ; `--align-stage conv4` tính `A_T` ở 113×113 thay vì 56×56.
+- `utils/checkpoint.py` — checkpoint 9 MB thay vì 265 MB (state_dict + kwargs, bỏ CLIP text
+  tower). `load_network()` đọc cả hai định dạng; checkpoint V1 tự khôi phục cấu hình `hard`/
+  `gate` nên số đo lại vẫn là số của đúng model đó.
+- `utils/diagnostics.py` + logging trong `train_network.py` — `align/score_margin`,
+  `token/{entropy,top1_mass,winning}`, `fusion/residual_ratio`, gradient của `L_grasp` và
+  `L_align` riêng rẽ lên visual encoder, probe set cố định vẽ lại qua các epoch, và
+  `counterfactual/prompt_drop` ngay trong lúc train. Cách đọc từng nhóm: mục "Đọc log" của
+  README.
+- `script/check_dataset.py` — kiểm dữ liệu trước khi train: foreground, IoU giữa các part cùng
+  object, tỉ lệ mask trùng nhau, số token mỗi prompt, lưới ảnh.
+- `script/audit_text_reliance.py` — bốn điều kiện đối chứng (thật / hoán vị / cố định / part
+  khác cùng object) + gallery lỗi bốn nhóm. `evaluate.py --shuffle-prompts` là bản gọn.
+- `script/smoke_test_align.py` — chạy được không cần dataset, không cần GPU.
+
 **Còn lại:**
 
-- Tải dữ liệu → chạy `split/build_grasp_anything_pp.py` → train. Chưa có số thật nào.
-- `--w-align` / `--w-agnostic` đang 1.0 / 1.0, chưa tune.
-- Checkpoint 265 MB vì `torch.save(net)` pickle cả CLIP text tower.
-- `F` ở bottleneck là 56×56 (stride 4) — hơi thô cho part-level; nếu `A_T` mờ thì thử tính sau
-  `conv4` (112×112).
+- Chạy ablation ở §6 với cùng ngân sách train (cần GPU + dữ liệu). `script/run_ablation.sh`
+  chạy sẵn bốn arm `notext / hardmax / soft / full` tuần tự trên một GPU, 100k scene, 50 epoch.
+- Kết quả `check_dataset.py` trên dữ liệu thật quyết định mức trần của cả hướng này: nếu phần
+  lớn part cùng object có mask trùng nhau thì `L_align` không dạy được grounding part-level.
 - `grasp_label_negative/` chưa dùng.

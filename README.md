@@ -12,6 +12,7 @@ This is the repository of the paper "Grasp-Anything: Large-scale Grasp Dataset f
    1. [Training](#training)
    1. [Testing](#testing)
    1. [Language-driven grasping trên GA++](#language-driven-grasping-trên-ga)
+   1. [Đọc log](#đọc-log)
 
 ## Installation
 - Create a virtual environment
@@ -69,21 +70,46 @@ prompt ──► CLIP text (đóng băng, per-token) ──► t_1..t_L
                                                     │
 ảnh ────► conv1..res5 ──► F (56×56×128) ────────────┤
                                                     ▼
-                       A_T = σ( max_j cos(W_v F_xy, W_t t_j) · exp(τ) )
+                   S_pj = cos(W_v F_p, W_t t_j) · exp(τ)
+                   α_pj = softmax_j(S_pj / τ_t)        token quan trọng tại pixel p
+                   A_T(p) = σ( Σ_j α_pj S_pj )         vùng quan trọng
+                   R_T(p) = Σ_j α_pj W_r t_j           text feature của vùng đó
                                                     │
-                       F' = F ⊙ (1 + λ·A_T) ──► conv4..conv6 ──► pos/cos/sin/width
-                                                    │
-                       Q_g = head_g(F)   (graspability, không điều kiện text)
+              F' = F + φ([F, F ⊙ A_T, R_T]) ──► conv4..conv6 ──► pos/cos/sin/width
 
-L = L_grasp + w_agnostic·BCE(Q_g, M_∪) + w_align·[BCE + Dice](A_T, part_mask)
+L = L_grasp + w_align · [BCE + Dice](A_T, part_mask)
 ```
 
-Gate đặt sau `res5` nên cả 4 head đều được condition. `A_T` và `Q_g` supervise ngay ở 56×56;
-target hạ xuống bằng avg-pool chứ không upsample logits lên 224. `use_text=False` biến đúng
-file này thành baseline GR-ConvNet không ngôn ngữ, dùng chung ngân sách train.
+Soft-select token tại **từng pixel** thay vì lấy `max`, và đưa cả *vùng* lẫn *text feature của
+vùng* vào decoder. Fusion đặt sau `res5` nên cả 4 head đều được condition; conv cuối của φ khởi
+tạo bằng 0 nên ở bước 0 thì `F' = F` đúng bằng baseline, nhánh ngôn ngữ đi vào dần. `A_T`
+supervise ngay ở 56×56, target hạ xuống bằng avg-pool chứ không upsample logits lên 224.
+Token SOT/EOT/padding **và dấu câu** bị loại khỏi candidate.
+
+Cùng một file, bốn arm của bảng ablation bật/tắt bằng cờ:
+
+| arm | `--use-text` | `--align-mode` | `--region-text` | `--fusion` |
+|---|---|---|---|---|
+| GR-ConvNet (no text) | 0 | – | – | – |
+| Hard-max (V1) | 1 | `hard` | 0 | `gate` |
+| Soft alignment | 1 | `soft` | 0 | `residual` |
+| **V2 full** | 1 | `soft` | 1 | `residual` |
+
+`--align-stage conv4` chuyển chỗ tính `A_T` từ 56×56 lên 113×113 (mịn hơn cho part nhỏ, đổi
+lại conv1..res5 không còn được prompt điều kiện).
 
 Chi tiết: [inference/models/grconvnet3_align.py](inference/models/grconvnet3_align.py),
 [utils/data/grasp_anything_pp_data.py](utils/data/grasp_anything_pp_data.py).
+
+Checkpoint lưu bằng [utils/checkpoint.py](utils/checkpoint.py): state_dict + kwargs, bỏ CLIP
+text tower — **9 MB** thay vì 265 MB. `load_network()` đọc được cả hai định dạng, kể cả
+checkpoint V1 (nó tự khôi phục cấu hình `hard`/`gate` để số đo lại đúng là số của model đó).
+
+Kiểm tra nhanh trước khi tốn GPU, không cần dataset:
+
+```bash
+python script/smoke_test_align.py     # 4 arm, checkpoint round-trip, overfit một batch
+```
 
 ### Dữ liệu
 
@@ -97,7 +123,7 @@ GA++ chỉ chứa phần ngôn ngữ + label; ảnh nằm ở repo Grasp-Anythin
 | scene | sample | % GA++ | đĩa (packed) |
 |---|---|---|---|
 | 10k | 44k | 1% | 1,8 GB |
-| 100k | 445k | 10% | 18 GB |
+| **100k** (mặc định) | **445k** | **10%** | **18 GB** |
 | 300k | 1,34M | 30% | 55 GB |
 | 994k (full) | 4,41M | 100% | 183 GB |
 
@@ -109,55 +135,118 @@ Schema đã verify trực tiếp trên archive — xem [notebooks/ga_pp_schema.i
 
 ### Chạy
 
+Cấu hình mặc định: **một GPU · 100.000 scene (~445k sample, 10% GA++) · 50 epoch**.
+
 ```bash
-# 1. tải + dựng dataset và split (bước lâu nhất)
+# 1. tải + dựng dataset, split, và kiểm dữ liệu (bước lâu nhất, có cache)
 SKIP_TRAIN=1 SKIP_EVAL=1 bash script/run_paper_setting.sh
 
 # 2. đo num_workers trên chính máy đó -- GPU gần như không bao giờ là chỗ nghẽn
 python script/bench_loader.py --dataset-path data/grasp-anything-pp-full \
     --split-path split/grasp-anything-pp --workers 8,16,32,48,64
 
-# 3. train + eval + gom kết quả (build/split đã cache nên bỏ qua)
+# 3. train + eval + đối chứng + gom kết quả (build/split đã cache nên bỏ qua)
 NUM_WORKERS=<số đo được> bash script/run_paper_setting.sh
 ```
 
-Mặc định bám những gì paper nêu rõ: GA++ đầy đủ · split Base/New 70/30 · 100 epoch ·
-success khi IoU ≥ 0.25 **và** lệch góc ≤ 30° · báo cáo Seen / Unseen / harmonic mean H.
-Batch size, optimizer, learning rate thì paper không công bố trong bản chính — giá trị dùng ở
-đây ghi trong header script và trong `config.txt` của mỗi lần chạy.
+Giữ nguyên theo paper: split Base/New 70/30 theo category · success khi IoU ≥ 0.25 **và** lệch
+góc ≤ 30° · báo cáo Seen / Unseen / harmonic mean H. Khác paper — vì chỉ có một GPU: **10% dữ
+liệu** (paper dùng cả 4,41M sample) và **50 epoch** (paper 100, Fig 6). Batch size, optimizer,
+learning rate thì paper không công bố trong bản chính. Mọi con số này ghi trong header script
+và trong `config.txt` của mỗi lần chạy — báo cáo phải nêu rõ, đừng đặt cạnh Table 2 như thể
+cùng điều kiện.
 
 Lưu ý: repo này định nghĩa "epoch" = `BATCHES_PER_EPOCH` batch, không phải một lượt qua hết dữ
-liệu. 100 × 2000 × 64 = 12,8M lượt sample ≈ 2,9 lượt qua 4,41M.
+liệu. 50 × 2000 × 64 = **6,4M lượt sample** ≈ 14 lượt qua 445k sample của subset.
 
-Có nhiều GPU thì chạy trọn bảng ablation song song (`train_network.py` không có DDP, một run
-chỉ dùng một GPU):
+Bảng ablation §6 chạy **tuần tự trên một GPU** (`train_network.py` không có DDP; nhét bốn tiến
+trình vào một GPU chỉ khiến chúng giành CPU của nhau, tổng thời gian không đổi mà không arm nào
+xong sớm):
 
 ```bash
-bash script/run_ablation_4gpu.sh                    # 4 arm trên 4 GPU
-GPUS="0 0 0 0" bash script/run_ablation_4gpu.sh     # 4 arm trên 1 GPU
+bash script/run_ablation.sh                      # 4 arm, tuần tự -- ≈ 4 lần một run đơn
+GPU=1 bash script/run_ablation.sh                # chọn GPU khác
+ARMS="soft full" bash script/run_ablation.sh     # chạy lại vài arm
+RESUME=1 bash script/run_ablation.sh             # đứt giữa chừng thì chạy tiếp
 ```
+
+Ngân sách train của mọi arm giống hệt nhau — điều kiện bắt buộc để bảng có nghĩa; script in con
+số đó ra đầu và cuối.
 
 ### Kết quả
 
 Mỗi lần chạy tự gom vào `results/<timestamp>_<description>/`:
 
 ```
-summary.md          bảng Seen/Unseen/H cạnh Table 2 của paper, + token mạnh nhất từng hình
-config.txt          đúng cấu hình đã chạy
-train.log  eval_seen.log  eval_unseen.log
+summary.md                  bảng Seen/Unseen/H cạnh Table 2, bảng đối chứng prompt, token/hình
+config.txt                  đúng cấu hình đã chạy
+dataset-check/              thống kê part_mask + prompt, lưới ảnh kiểm tra bằng mắt
+train.log  eval_seen.log  eval_unseen.log  audit_text_reliance.{log,json}
 tensorboard/
-figures/            prediction_*.png, tokens_*.png, parts_same_object.png, prompts_free_form.png
+figures/                    diagnostic_*, prompt_grid, failures_*, prediction_*, tokens_*
 ```
 
-Hai loại hình:
+Bốn loại hình, theo thứ tự nên nhìn:
 
-- `prediction_{seen,unseen}_*.png` — grasp dự đoán (đỏ) cạnh ground truth (lục), kèm bản đồ Q,
-  góc và `A_T`. Tiêu đề ghi IoU cao nhất và đạt/trượt theo đúng metric của paper.
-- `tokens_{seen,unseen}_*.png` — bản đồ alignment của **từng token** trong prompt cạnh
-  `part_mask` ground truth, cho thấy nhánh ngôn ngữ có thật sự chọn đúng vùng hay không. Vẽ lại mà không
-train lại: `python script/export_results.py --checkpoint <ckpt> --dataset-path <data> --out <dir>`.
+- `prompt_grid.png` — **hình quan trọng nhất**: cùng một ảnh, đổi prompt. Mỗi hàng là
+  `part_mask` GT · `A_T` · token mạnh nhất kèm attention mass · Q · grasp. Ba hàng giống hệt
+  nhau nghĩa là model đang bỏ qua ngôn ngữ, bất kể `align_loss` thấp đến đâu.
+- `diagnostic_{seen,unseen}_*.png` — một hàng đầy đủ cho một sample: RGB · `part_mask` GT ·
+  `A_T` · **bản đồ sai số** (xanh TP / đỏ FP / vàng FN) · Q · GT+dự đoán · token mạnh nhất.
+- `failures_{seen,unseen}.png` — gallery lỗi bốn nhóm (align đúng/grasp đúng · align đúng/grasp
+  sai · align sai/grasp sai · không phát hiện grasp). Nhóm nào đông cho biết lỗi nằm ở
+  grounding hay ở grasp decoder — hai hướng sửa khác hẳn nhau.
+- `prediction_*.png`, `tokens_*.png`, `parts_same_object.png` — như trước.
+
+Vẽ lại mà không train lại:
+`python script/export_results.py --checkpoint <ckpt> --dataset-path <data> --out <dir>`.
 
 `results/` nằm trong `.gitignore`.
+
+### Đọc log
+
+Ba câu hỏi cần trả lời khi debug nhánh ngôn ngữ, và chỗ trả lời từng câu.
+
+**Trước khi train — dữ liệu có dạy được không?**
+
+```bash
+python script/check_dataset.py --data-dir data/grasp-anything-pp-full     --split-path split/grasp-anything-pp --out results/dataset-check
+```
+
+In ra: tỉ lệ foreground của `part_mask`, IoU giữa các part **cùng object**, tỉ lệ part có mask
+trùng nhau, số token còn lại mỗi prompt sau khi lọc, và một lưới ảnh + prompt + mask + grasp GT.
+Cảnh báo quan trọng: nếu phần lớn cặp part cùng object có IoU > 0.9 thì supervision thực tế ở
+mức *object* chứ không phải mức part — `L_align` không thể dạy grounding part-level, và Δ trong
+bảng đối chứng sẽ nhỏ dù model không có lỗi gì. Báo cáo sâu hơn kèm ví dụ:
+`script/diagnose_part_masks.py`. Bước này đã nằm sẵn trong `run_paper_setting.sh` (bước 3/7).
+
+**Trong lúc train — TensorBoard** (`--diag-interval`, `--probe-samples`, `--counterfactual-every`)
+
+| nhóm tag | đọc thế nào |
+|---|---|
+| `loss/{train,val}/{total,grasp,align_bce,align_dice}` | tách riêng vì warmup làm *tổng* đi lên trong lúc từng thành phần đang đi xuống |
+| `weight/lambda_align`, `optimizer/lr` | giá trị λ *thực tế* của epoch đó (đã nhân warmup) |
+| `align/{iou,dice,score_margin,foreground_score,background_score,predicted_area}` | `score_margin = mean(A_T ∣ trong mask) − mean(A_T ∣ ngoài mask)`; gần 0 = attention chưa phân biệt fg/bg, kể cả khi BCE đã nhỏ |
+| `token/{attention_entropy,top1_mass,top3_mass,valid_count,temperature,logit_scale}` | entropy ≈ 0 là collapse vào một token; ≈ `token/max_entropy` là không token nào quan trọng; `top1_mass ≈ 1` ngay từ đầu = soft attention đang chạy y hệt hard max; `logit_scale` chạm 100 là temperature có vấn đề |
+| `token/winning` (text) | bảng "token nào thắng bao nhiêu % pixel" trên cả tập val. Top toàn danh từ object (`apple`, `mug`) = đang định vị *vật* chứ không phải *part*. `token/punctuation_mass` phải bằng **0** |
+| `fusion/{feature_norm,residual_norm,residual_ratio}` | `r_F = ‖F'−F‖/‖F‖`: ≈ 0 là fusion gần như không tác động (khởi tạo đúng bằng 0, phải thấy nó *lớn dần*); ≫ 1 là fusion lấn át feature thị giác |
+| `gradient/{visual_encoder,text_projection,alignment,fusion,grasp_decoder}` | chuẩn L2 gradient theo khối, ghi mỗi `--diag-interval` batch |
+| `gradient/visual_from_{grasp,align,ratio}` | gradient của `L_grasp` và `L_align` **riêng rẽ** lên visual encoder, trên cùng một batch. `ratio` hàng chục lần trở lên = giảm `--w-align` hoặc kéo dài `--warmup-epochs` |
+| `counterfactual/{normal,shuffled,fixed}_success`, `counterfactual/prompt_drop` | `Δ_prompt = S_normal − S_shuffled`. Gần 0 thì **không kết luận được** nhánh ngôn ngữ có ích |
+| `probe/*` (hình) | probe set **cố định** 8 sample, vẽ lại ở epoch 0, 1, 3, 10, 25 và mỗi epoch tốt nhất — thấy được attention bắt đầu học lúc nào, có collapse sau warmup không |
+| `step/token/*`, `step/fusion/*` | cùng chỉ số nhưng đo trên batch train theo *step*, không phải theo epoch |
+
+**Sau khi train — đối chứng, quan trọng hơn mọi đường loss**
+
+```bash
+python script/audit_text_reliance.py --checkpoint logs/.../epoch_67_iou_0.3313     --dataset-path data/grasp-anything-pp-full --split-path split/grasp-anything-pp     --n-samples 500 --figures results/audit
+```
+
+Bốn điều kiện trên cùng một sample: prompt thật · prompt của object khác (`shuffled`) · một câu
+chung cho mọi ảnh (`fixed`) · prompt của part khác cùng object (`other_part`). Đọc:
+`Δ_shuffled ≈ 0` là grasp không phụ thuộc prompt; `Δ_shuffled` lớn nhưng `Δ_other_part ≈ 0` là
+model mới nhận ra *vật*, chưa phân biệt *part*. `evaluate.py --shuffle-prompts` làm phiên bản
+gọn của phép này cho một split.
 
 ### Notebook
 

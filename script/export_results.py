@@ -9,6 +9,7 @@ tức là đúng luận điểm của method. Xem utils/visualisation/alignment.
 """
 import argparse
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -21,10 +22,13 @@ import torch  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.checkpoint import load_network  # noqa: E402
 from utils.data import get_dataset  # noqa: E402
 from utils.visualisation.alignment import (plot_grasp_prediction,  # noqa: E402
                                            plot_part_prompts,
                                            plot_prompt_comparison,
+                                           plot_prompt_grid,
+                                           plot_sample_diagnostics,
                                            plot_token_alignment)
 
 REFERENCE = [("GR-ConvNet + CLIP", 0.37, 0.18, 0.24),
@@ -52,7 +56,10 @@ def parse_args():
     p.add_argument("--tensorboard-dir", default=None)
     p.add_argument("--config", default=None, help="File cấu hình để chép kèm")
     p.add_argument("--copy-checkpoint", action="store_true",
-                   help="Chép luôn checkpoint (~265 MB) vào results/")
+                   help="Chép luôn checkpoint vào results/")
+    p.add_argument("--audit-json", default=None,
+                   help="JSON của script/audit_text_reliance.py, để đưa bảng đối chứng vào "
+                        "summary.md (mặc định: <out>/audit_text_reliance.json nếu có)")
     return p.parse_args()
 
 
@@ -75,8 +82,12 @@ def main():
     os.makedirs(figures, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    net = torch.load(args.checkpoint, map_location=device, weights_only=False).eval()
-    print(f"checkpoint: {args.checkpoint}  ({device})")
+    net = load_network(args.checkpoint, map_location=device)
+    # Arm baseline (`--use-text 0`) không có nhánh ngôn ngữ: mọi hình dựa trên token/A_T phải
+    # bỏ qua, nếu không `net.token_alignment()` ném RuntimeError và giết luôn bước export của
+    # đúng cái arm dùng làm mốc so sánh.
+    has_text = getattr(net, "use_text", False)
+    print(f"checkpoint: {args.checkpoint}  ({device}, use_text={has_text})")
 
     # ------------------------------------------------------------- hình ----
     print("\nvẽ hình:")
@@ -93,12 +104,18 @@ def main():
             save(fig, os.path.join(figures, f"prediction_{name}_{k:02d}.png"))
             pred_note[f"{name}_{k:02d}"] = info
 
-            fig, ranked = plot_token_alignment(net, x, extra["prompt"],
-                                               part_mask=extra["part_mask"], max_tokens=7)
-            save(fig, os.path.join(figures, f"tokens_{name}_{k:02d}.png"))
-            ranked_note[f"{name}_{k:02d}"] = (extra["prompt"], ranked)
+            if has_text:
+                fig, ranked = plot_token_alignment(net, x, extra["prompt"],
+                                                   part_mask=extra["part_mask"], max_tokens=7)
+                save(fig, os.path.join(figures, f"tokens_{name}_{k:02d}.png"))
+                ranked_note[f"{name}_{k:02d}"] = (extra["prompt"], ranked)
 
-        if seen:
+            # Hàng chẩn đoán đầy đủ: thêm bản đồ sai số của A_T (TP/FP/FN) và attention mass
+            # của từng token -- đủ để nói lỗi nằm ở grounding hay ở grasp decoder.
+            fig, _ = plot_sample_diagnostics(net, ds, idx)
+            save(fig, os.path.join(figures, f"diagnostic_{name}_{k:02d}.png"))
+
+        if seen and has_text:
             # Cùng một object, nhiều part -> đổi prompt thì A_T phải dịch theo.
             obj, files = max(ds._files_by_object.items(), key=lambda kv: len(kv[1]))
             idxs = [ds.grasp_files.index(f) for f in files][:4]
@@ -109,6 +126,12 @@ def main():
             x, _, _, _, _, extra = ds[0]
             save(plot_prompt_comparison(net, x, [extra["prompt"]] + FREE_PROMPTS),
                  os.path.join(figures, "prompts_free_form.png"))
+
+            # Cùng một ảnh, đổi prompt: hình quan trọng nhất. Ba hàng giống hệt nhau =
+            # model bỏ qua ngôn ngữ.
+            grid = [("thật", extra["prompt"])] + [("tự viết", p) for p in FREE_PROMPTS]
+            save(plot_prompt_grid(net, ds, 0, grid),
+                 os.path.join(figures, "prompt_grid.png"))
 
     # -------------------------------------------------------------- log ----
     print("\nchép log:")
@@ -146,6 +169,27 @@ def main():
                   "",
                   "Metric: success khi IoU ≥ 0.25 và lệch góc ≤ 30°.", ""]
 
+    audit_path = args.audit_json or os.path.join(args.out, "audit_text_reliance.json")
+    if os.path.isfile(audit_path):
+        with open(audit_path) as f:
+            audit = json.load(f)
+        lines += ["## Đối chứng prompt", "",
+                  "Cùng ảnh, cùng ground truth, chỉ đổi prompt "
+                  "(`script/audit_text_reliance.py`).", "",
+                  "| split | điều kiện | n | success | IoU | A_T IoU | pointing |",
+                  "|---|---|---|---|---|---|---|"]
+        for split, r in audit.get("results", {}).items():
+            for cond, row in r.get("conditions", {}).items():
+                lines.append(
+                    f"| {split} | {cond} | {row['n']} | {row['success']:.4f} | "
+                    f"{row['iou']:.4f} | {row.get('align_iou', float('nan')):.4f} | "
+                    f"{row.get('pointing', float('nan')):.4f} |")
+        drops = [f"{split}: " + ", ".join(
+            f"Δ_{c} = {r[f'drop_{c}']:+.4f}" for c in ("shuffled", "fixed", "other_part")
+            if f"drop_{c}" in r) for split, r in audit.get("results", {}).items()]
+        lines += ["", "Δ = success(prompt thật) − success(prompt thay thế). Δ ≈ 0 nghĩa là "
+                  "grasp không phụ thuộc prompt.", ""] + [f"- {d}" for d in drops] + [""]
+
     lines += ["## Hình", "",
               "- `figures/prediction_{seen,unseen}_*.png` — grasp dự đoán (đỏ) cạnh ground "
               "truth (lục), kèm bản đồ Q, góc và `A_T`. Tiêu đề ghi IoU cao nhất và đạt/trượt "
@@ -153,7 +197,14 @@ def main():
               "- `figures/tokens_{seen,unseen}_*.png` — bản đồ alignment của từng token trong "
               "prompt, cạnh `part_mask` ground truth và `A_T` tổng hợp.",
               "- `figures/parts_same_object.png` — cùng một object, đổi part trong câu lệnh.",
-              "- `figures/prompts_free_form.png` — prompt tự viết trên cùng một ảnh.", "",
+              "- `figures/prompts_free_form.png` — prompt tự viết trên cùng một ảnh.",
+              "- `figures/diagnostic_{seen,unseen}_*.png` — RGB · part_mask · `A_T` · sai số "
+              "`A_T` (xanh TP / đỏ FP / vàng FN) · Q · grasp · token mạnh nhất kèm attention "
+              "mass.",
+              "- `figures/prompt_grid.png` — cùng một ảnh, đổi prompt: `A_T`, token và grasp "
+              "phải đổi theo.",
+              "- `figures/failures_{seen,unseen}.png` — gallery lỗi bốn nhóm (nếu đã chạy "
+              "audit với `--figures`).", "",
               "### Dự đoán trên từng mẫu", "",
               "| mẫu | prompt | grasp phát hiện | IoU cao nhất | kết quả |",
               "|---|---|---|---|---|"]
@@ -165,10 +216,14 @@ def main():
         lines.append(f"| {key} | \"{info['prompt']}\" | {info['n_grasps']} | "
                      f"{info['iou']:.3f} | {mark} |")
 
-    lines += ["", "### Token mạnh nhất theo từng hình", ""]
-    for key, (prompt, ranked) in ranked_note.items():
-        top = ", ".join(f"`{t}` {v:.2f}" for t, v in ranked[:4])
-        lines.append(f"- **{key}** — \"{prompt}\" → {top}")
+    if ranked_note:
+        lines += ["", "### Token mạnh nhất theo từng hình", ""]
+        for key, (prompt, ranked) in ranked_note.items():
+            top = ", ".join(f"`{t}` {v:.2f}" for t, v in ranked[:4])
+            lines.append(f"- **{key}** — \"{prompt}\" → {top}")
+    else:
+        lines += ["", "Checkpoint này không có nhánh ngôn ngữ (`use_text=0`) nên không có hình "
+                  "token/alignment.", ""]
 
     path = os.path.join(args.out, "summary.md")
     with open(path, "w") as f:

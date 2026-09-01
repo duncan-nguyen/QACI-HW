@@ -6,6 +6,7 @@ import torch.utils.data
 
 from hardware.device import get_device
 from inference.post_process import post_process_output
+from utils.checkpoint import load_network
 from utils.data import get_dataset
 from utils.data.index_split import SUBSETS, describe, index_splits, select_subset
 from utils.dataset_processing import evaluation, grasp
@@ -15,16 +16,15 @@ logging.basicConfig(level=logging.INFO)
 
 
 def eval_extras(net, batch, device):
-    """Phần tử thứ 6 (prompt/part_mask/union_pos) của Grasp-Anything++; xem train_network.py."""
+    """Phần tử thứ 6 (prompt/part_mask) của Grasp-Anything++; xem train_network.py."""
     if len(batch) < 6 or not getattr(net, "accepts_extras", False):
         return {}
     extra = batch[5]
     kwargs = {}
     if "prompt" in extra:
         kwargs["prompts"] = extra["prompt"]
-    for key in ("part_mask", "union_pos"):
-        if key in extra:
-            kwargs[key] = extra[key].to(device)
+    if "part_mask" in extra:
+        kwargs["part_mask"] = extra["part_mask"].to(device)
     return kwargs
 
 
@@ -132,6 +132,12 @@ def parse_args():
         default=1,
         help="Flag for using seen classes, only work for Grasp-Anything dataset",
     )
+    parser.add_argument(
+        "--shuffle-prompts",
+        action="store_true",
+        help="ĐỐI CHỨNG: ghép mỗi ảnh với prompt của một object khác. Nếu accuracy gần như "
+        "không đổi thì model đang bỏ qua ngôn ngữ. Chỉ dùng được với grasp-anything-pp.",
+    )
 
     args = parser.parse_args()
 
@@ -168,6 +174,18 @@ if __name__ == "__main__":
         ds_kwargs["split_path"] = args.split_path
     test_dataset = Dataset(args.dataset_path, **ds_kwargs)
 
+    if args.shuffle_prompts:
+        if not hasattr(test_dataset, "shuffle_prompts"):
+            raise SystemExit(
+                f"--shuffle-prompts chỉ có nghĩa với dataset có prompt; {args.dataset} không có."
+            )
+        test_dataset.shuffle_prompts(seed=args.random_seed)
+        logging.warning(
+            "--shuffle-prompts: prompt đã bị hoán vị (seed %d). Con số dưới đây là ĐỐI CHỨNG "
+            "ÂM, không phải kết quả của model.",
+            args.random_seed,
+        )
+
     # Dùng chung utils/data/index_split.py với train_network.py: hai file cắt index bằng đúng
     # một hàm nên không thể lệch nhau nữa.
     splits = index_splits(
@@ -200,10 +218,10 @@ if __name__ == "__main__":
     for network in args.network:
         logging.info(f"\nEvaluating model {network}")
 
-        # Load Network. `.eval()` là bắt buộc: model có dropout p=0.1 và BatchNorm, mà cờ
-        # training được lưu kèm checkpoint -- trước đây chỉ đúng nhờ may mắn (train_network.py
-        # tình cờ save ngay sau validate()).
-        net = torch.load(network, map_location=device, weights_only=False).eval()
+        # load_network đọc cả checkpoint state_dict (mới) lẫn module đã pickle (cũ) và luôn
+        # trả về model ở .eval() -- bắt buộc vì model có dropout 0,1 và BatchNorm, mà cờ
+        # training được lưu kèm checkpoint.
+        net = load_network(network, map_location=device)
 
         results = {"correct": 0, "failed": 0}
 

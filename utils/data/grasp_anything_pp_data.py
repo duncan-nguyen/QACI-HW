@@ -48,7 +48,7 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         seen=True,
         include_prompt=True,
         include_mask=True,
-        include_union=True,
+        include_union=False,
         split_path=None,
         **kwargs,
     ):
@@ -59,7 +59,10 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         :param seen: Lấy split seen (True) hay unseen (False).
         :param include_prompt: Trả kèm prompt gắp.
         :param include_mask: Trả kèm part_mask (đã chịu cùng rot/zoom với ảnh).
-        :param include_union: Trả kèm M_union -- bản đồ graspability hợp mọi part của object.
+        :param include_union: Trả kèm M_union -- hợp grasp của mọi part cùng object. Mặc định
+                              tắt: V2 bỏ nhánh Q_g/L_agnostic, mà dựng M_union phải đọc và vẽ
+                              lại grasp của *mọi* part cùng object (~4,4 lần công việc) cho
+                              một target không ai dùng. Bật lại nếu cần cho phân tích.
         :param split_path: Thư mục split tự chọn; mặc định dò theo SPLIT_DIRS.
         :param kwargs: kwargs của GraspDatasetBase.
         """
@@ -117,6 +120,10 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         if ds_rotate:
             split = int(self.length * ds_rotate)
             self.grasp_files = self.grasp_files[split:] + self.grasp_files[:split]
+
+        # None = prompt thật. shuffle_prompts()/set_fixed_prompt() đổi hai cờ này.
+        self._prompt_perm = None
+        self._fixed_prompt = None
 
     # ------------------------------------------------------------------ split --
     @staticmethod
@@ -207,7 +214,7 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         if zoom != 1.0:
             h, w = img.img.shape[0], img.img.shape[1]
             sr, sc = int(h * (1 - zoom)) // 2, int(w * (1 - zoom)) // 2
-            img.img = img.img[sr:h - sr, sc:w - sc]
+            img.img = img.img[sr : h - sr, sc : w - sc]
         img.resize((self.output_size, self.output_size))
         if rot != 0.0:
             img.rotate(rot)
@@ -215,20 +222,92 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     def get_rgb(self, idx, rot=0, zoom=1.0, normalise=True):
         rot, zoom = float(rot), float(zoom)
-        rgb_img = self._augment(image.Image.from_file(self.get_rgb_file(idx)), rot, zoom)
+        rgb_img = self._augment(
+            image.Image.from_file(self.get_rgb_file(idx)), rot, zoom
+        )
         if normalise:
             rgb_img.normalise()
             rgb_img.img = rgb_img.img.transpose((2, 0, 1))
         return rgb_img.img
 
-    def get_prompt(self, idx):
-        """Câu lệnh gắp của sample này, ví dụ "Lift apple by its skin."."""
+    def get_prompt(self, idx, use_permutation=True):
+        """
+        Câu lệnh gắp của sample này, ví dụ "Lift apple by its skin.".
+
+        Sau `shuffle_prompts()` thì trả prompt của một sample *khác* -- ảnh giữ nguyên, câu
+        lệnh thành sai. Xem docstring ở đó.
+
+        :param use_permutation: False để lấy prompt thật kể cả khi đang bật hoán vị (để so
+                                sánh hai bên trên cùng một sample, xem
+                                script/audit_text_reliance.py).
+        """
+        if self._fixed_prompt is not None:
+            return self._fixed_prompt
+        if use_permutation and self._prompt_perm is not None:
+            idx = int(self._prompt_perm[idx])
         with open(self.get_prompt_file(idx), "rb") as f:
             prompt = pickle.load(f)
         # GA++ lưu một str thuần, nhưng vài file cũ gói trong list/tuple.
         if not isinstance(prompt, str):
             prompt = prompt[0]
         return prompt
+
+    def shuffle_prompts(self, seed=0):
+        """
+        Ghép ảnh với prompt của sample khác -- phép đối chứng cho câu hỏi "model có *thật sự*
+        đọc prompt không".
+
+        Nếu accuracy gần như không đổi khi prompt bị hoán vị thì nhánh ngôn ngữ không đóng góp
+        gì: model chỉ đang đoán grasp trung bình của ảnh. Đây là control âm bắt buộc cho một
+        method language-driven, và rẻ hơn nhiều so với train lại một arm no-text.
+
+        Hoán vị được vá để không sample nào giữ nguyên prompt của chính nó *và* không nhận
+        prompt của một part khác cùng object (prompt cùng object vẫn nói về đúng vật đó, làm
+        control yếu đi).
+
+        `part_mask` và grasp label **không** bị hoán vị: chúng vẫn là ground truth của ảnh,
+        nên `align_loss` đo lúc này chính là mức lệch do prompt sai gây ra.
+
+        :param seed: seed để tái lập đúng phép hoán vị
+        :return: self (tiện gọi nối)
+        """
+        rng = np.random.default_rng(seed)
+        n = len(self.grasp_files)
+        perm = rng.permutation(n)
+        objects = [self._object_id(self._sample_id(f)) for f in self.grasp_files]
+
+        # Một lượt vá: chỗ nào tự ghép vào chính object mình thì đổi với một vị trí ngẫu nhiên
+        # khác. Dataset thật có hàng trăm nghìn object nên số lần đụng là rất nhỏ.
+        for i in range(n):
+            if objects[perm[i]] != objects[i]:
+                continue
+            for _ in range(8):
+                j = int(rng.integers(n))
+                if objects[perm[j]] != objects[i] and objects[perm[i]] != objects[j]:
+                    perm[i], perm[j] = perm[j], perm[i]
+                    break
+
+        self._prompt_perm = perm
+        return self
+
+    def set_fixed_prompt(self, prompt):
+        """
+        Một prompt duy nhất cho *mọi* ảnh -- đối chứng thứ hai.
+
+        Hoán vị prompt vẫn đưa vào model một câu đúng ngữ pháp, đúng phân phối; prompt cố định
+        thì lấy đi cả thông tin lẫn sự đa dạng. Nếu accuracy không tụt kể cả ở đây thì nhánh
+        ngôn ngữ chắc chắn không đóng góp gì.
+
+        :return: self
+        """
+        self._fixed_prompt = prompt
+        return self
+
+    def real_prompts(self):
+        """Bỏ hoán vị / prompt cố định, quay lại prompt thật."""
+        self._prompt_perm = None
+        self._fixed_prompt = None
+        return self
 
     def get_part_mask(self, idx, rot=0, zoom=1.0):
         """
@@ -248,8 +327,9 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         """
         mask = np.load(self.get_mask_file(idx))
         if mask.ndim == 1:
-            mask = np.unpackbits(mask)[:SOURCE_SIZE * SOURCE_SIZE].reshape(SOURCE_SIZE,
-                                                                          SOURCE_SIZE)
+            mask = np.unpackbits(mask)[: SOURCE_SIZE * SOURCE_SIZE].reshape(
+                SOURCE_SIZE, SOURCE_SIZE
+            )
         return mask
 
     def get_union_gtbb(self, idx, rot=0, zoom=1.0):

@@ -8,6 +8,7 @@ import torch
 from hardware.camera import RealSenseCamera
 from hardware.device import get_device
 from inference.post_process import post_process_output
+from utils.checkpoint import load_network
 from utils.data.camera_data import CameraData
 from utils.dataset_processing.grasp import detect_grasps
 from utils.visualisation.plot import plot_grasp
@@ -45,9 +46,9 @@ class GraspGenerator:
         print('Loading model... ')
         # Chọn device trước khi load, để map_location có giá trị thật.
         self.device = get_device(force_cpu=False)
-        self.model = torch.load(
-            self.saved_model_path, map_location=self.device, weights_only=False
-        )
+        # load_network đọc cả hai định dạng checkpoint của repo (state_dict mới và module
+        # pickle cũ) -- xem utils/checkpoint.py.
+        self.model = load_network(self.saved_model_path, map_location=self.device)
 
     def generate(self):
         # Get RGB-D image from camera

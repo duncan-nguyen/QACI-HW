@@ -1,23 +1,39 @@
-"""GR-ConvNet-3 với text-visual alignment ở mức part (language-driven grasping).
+"""GR-ConvNet-3 + grasp-aware text-visual alignment ở mức part (language-driven grasping).
 
 Ý tưởng: prompt của Grasp-Anything++ nhắm vào một *part* cụ thể ("grasp the mug at its
 handle"), nên tín hiệu ngôn ngữ phải chọn *vùng* trên ảnh chứ không chỉ đổi output cuối. Ta
-tính một bản đồ alignment token-pixel `A_T` ngay tại bottleneck rồi dùng nó gate feature,
-và supervise `A_T` **tường minh** bằng `part_mask` của GA++ -- nhãn khác loại với grasp
+tính relevance giữa **mọi token** và **mọi pixel**, soft-select token quan trọng tại từng
+pixel, rồi đưa cả *vùng quan trọng* `A_T` lẫn *text feature của vùng đó* `R_T` vào decoder.
+`A_T` được supervise **tường minh** bằng `part_mask` của GA++ -- nhãn khác loại với grasp
 rectangle, nên nhánh ngôn ngữ không chỉ học lại đúng thứ mà nhánh grasp đã học.
 
     prompt ──► CLIP text (frozen) ──► t_1..t_L
                                           │
     ảnh ────► conv1..res5 ──► F (56×56) ──┤
                                           ▼
-                        A_T = σ( max_j cos(W_v F_xy, W_t t_j) / τ )
+                         S_pj = cos(W_v F_p, W_t t_j) / τ
+                         α_pj = softmax_j(S_pj / τ_t)      token quan trọng tại p
+                         A_T(p) = σ(Σ_j α_pj S_pj)         vùng quan trọng
+                         R_T(p) = Σ_j α_pj W_r t_j         text feature của vùng đó
                                           │
-                        F' = F ⊙ (1 + λ·A_T)  ──► conv4..conv6 ──► pos/cos/sin/width
-                                          │
-                        Q_g = head_g(F)  (graspability, không điều kiện text)
+                    F' = F + φ([F, F ⊙ A_T, R_T])  ──► conv4..conv6 ──► pos/cos/sin/width
 
-    L = L_grasp + λ1·BCE(Q_g, M_union) + λ2·[BCE + Dice](A_T, part_mask)
+    L = L_grasp + w_align · [BCE + Dice](A_T, part_mask)
+
+Cờ bật/tắt cho bảng ablation của idea.md §6 -- cùng một file, cùng ngân sách train:
+
+    arm            use_text  align_mode  region_text  fusion     w_align
+    no-text        False     -           -            -          0
+    hard-max (V1)  True      hard        False        gate       > 0
+    soft           True      soft        False        residual   > 0
+    V2 full        True      soft        True         residual   > 0
+
+So với V1 (commit trước): `max` theo token -> softmax; thêm `R_T`; gate nhân
+`F ⊙ (1+λA_T)` -> residual fusion; bỏ hẳn `Q_g`/`L_agnostic`; loại thêm token dấu câu khỏi
+candidate (V1 chỉ loại SOT/EOT/pad, nên `.` thường là token "mạnh nhất" trong hình alignment).
+Checkpoint V1 vẫn load và chạy được -- xem `__setstate__`.
 """
+import contextlib
 import logging
 
 import torch
@@ -27,8 +43,11 @@ import torch.nn.functional as F
 from inference.models.grconvnet3 import GenerativeResnet
 
 CLIP_MODEL = 'openai/clip-vit-base-patch32'
-CLIP_DIM = 512
 MAX_PROMPT_TOKENS = 16      # prompt GA++ dài nhất ~11 từ, 77 của CLIP là phí
+
+# masked_fill bằng -inf làm softmax ra NaN khi *mọi* token của một prompt đều bị loại; -1e4 đủ
+# nhỏ để α ≈ 0 mà vẫn hữu hạn. Trường hợp prompt rỗng được xử lý riêng bằng cờ `valid`.
+NEG_INF = -1e4
 
 
 class CLIPTextEncoder(nn.Module):
@@ -36,10 +55,11 @@ class CLIPTextEncoder(nn.Module):
     CLIP text encoder đóng băng, trả embedding **từng token** (không phải một vector EOT).
 
     `CLIPTextModel.last_hidden_state` cho cả chuỗi; ta chiếu qua `text_projection` để về cùng
-    không gian với image embedding của CLIP, rồi mask bỏ SOT/EOT/padding.
+    không gian với image embedding của CLIP, rồi mask bỏ SOT/EOT/padding **và dấu câu**.
     """
 
-    def __init__(self, model_name=CLIP_MODEL, max_length=MAX_PROMPT_TOKENS):
+    def __init__(self, model_name=CLIP_MODEL, max_length=MAX_PROMPT_TOKENS,
+                 drop_punctuation=True):
         super(CLIPTextEncoder, self).__init__()
         from transformers import CLIPTextModelWithProjection, CLIPTokenizerFast
         from transformers import logging as hf_logging
@@ -52,15 +72,44 @@ class CLIPTextEncoder(nn.Module):
             logging.getLogger(name).setLevel(logging.WARNING)
 
         self.max_length = max_length
+        self.drop_punctuation = drop_punctuation
         self.tokenizer = CLIPTokenizerFast.from_pretrained(model_name)
         self.model = CLIPTextModelWithProjection.from_pretrained(model_name)
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
+        # Tra cứu "token này có nội dung không" theo id, dựng một lần cho cả vocab (49.408
+        # mục) thay vì decode lại mỗi batch. Hình alignment của run V1 cho thấy token mạnh
+        # nhất thường là `.` -- dấu câu hút hết attention mà không mang thông tin part nào.
+        vocab = self.tokenizer.get_vocab()
+        is_content = torch.zeros(max(vocab.values()) + 1, dtype=torch.bool)
+        for token, idx in vocab.items():
+            is_content[idx] = any(ch.isalnum() for ch in token.replace('</w>', ''))
+        self.register_buffer('is_content', is_content, persistent=False)
+
     @property
     def dim(self):
         return self.model.config.projection_dim
+
+    def __setstate__(self, state):
+        """
+        Encoder trong checkpoint V1 không có `drop_punctuation` lẫn bảng `is_content`.
+
+        Giữ đúng hành vi V1 (dấu câu *được* tính là candidate) để con số đo lại từ checkpoint
+        cũ vẫn là con số của model đó, không phải của một biến thể khác.
+        """
+        super(CLIPTextEncoder, self).__setstate__(state)
+        if not hasattr(self, 'drop_punctuation'):
+            self.drop_punctuation = False
+            logging.getLogger(__name__).info(
+                'Checkpoint V1: giữ nguyên hành vi cũ, không loại token dấu câu.')
+        if 'is_content' not in self._buffers:
+            vocab = self.tokenizer.get_vocab()
+            is_content = torch.zeros(max(vocab.values()) + 1, dtype=torch.bool)
+            for token, idx in vocab.items():
+                is_content[idx] = any(ch.isalnum() for ch in token.replace('</w>', ''))
+            self.register_buffer('is_content', is_content, persistent=False)
 
     def train(self, mode=True):
         # Giữ text encoder ở eval kể cả khi net.train() -- nó đóng băng.
@@ -92,52 +141,111 @@ class CLIPTextEncoder(nn.Module):
         out = self.model.text_model(**tok).last_hidden_state          # (B, L, hidden)
         emb = self.model.text_projection(out)                         # (B, L, D)
 
+        ids = tok['input_ids']
         mask = tok['attention_mask'].bool()
         # Bỏ SOT (luôn ở vị trí 0) và EOT (token cuối cùng còn attend được).
         mask[:, 0] = False
         eot = tok['attention_mask'].sum(dim=1) - 1
         mask[torch.arange(mask.shape[0], device=device), eot] = False
+        if self.drop_punctuation:
+            mask &= self.is_content.to(device)[ids]
         return emb, mask
 
 
-class TokenPixelAlignment(nn.Module):
+class TokenRegionAlignment(nn.Module):
     """
-    Cosine similarity giữa mọi token văn bản và mọi pixel của feature map, max theo token.
+    Relevance giữa mọi token văn bản và mọi pixel của feature map (idea.md §3).
 
-    Trả *logits* (chưa sigmoid) để dùng thẳng với BCEWithLogits -- ổn định số hơn.
+    Trả *logits* của `A_T` (chưa sigmoid) để dùng thẳng với BCEWithLogits -- ổn định số hơn --
+    kèm `R_T` (text feature của vùng) và trọng số token `α` để visualize.
     """
 
-    def __init__(self, visual_dim, text_dim, proj_dim=128, init_temperature=0.07):
-        super(TokenPixelAlignment, self).__init__()
+    def __init__(self, visual_dim, text_dim, proj_dim=128, region_dim=64, mode='soft',
+                 region_text=True, token_temperature=1.0, init_temperature=0.07):
+        super(TokenRegionAlignment, self).__init__()
+        if mode not in ('soft', 'hard'):
+            raise ValueError(f"align_mode phải là 'soft' hoặc 'hard', nhận '{mode}'")
+
+        self.mode = mode
+        self.token_temperature = token_temperature
         self.v_proj = nn.Conv2d(visual_dim, proj_dim, kernel_size=1)
         self.t_proj = nn.Linear(text_dim, proj_dim)
+        # W_r: text feature đưa vào decoder, tách khỏi W_t để không gian dùng cho *so khớp* và
+        # không gian dùng để *mô tả* không phải là một.
+        self.r_proj = nn.Linear(text_dim, region_dim) if region_text else None
         # Cosine ∈ [-1, 1] không đủ dải cho BCE -> cần nhiệt độ học được.
         self.logit_scale = nn.Parameter(torch.tensor(1.0 / init_temperature).log())
 
+    @property
+    def region_dim(self):
+        return 0 if self.r_proj is None else self.r_proj.out_features
+
     def per_token(self, feat, text_emb, text_mask):
         """
-        Bản đồ alignment của **từng** token -- đây là thứ để visualize "token nào ăn vùng nào".
+        S_pj cho **từng** token -- đây là thứ để visualize "token nào ăn vùng nào".
 
-        :return: (B, L, H, W) logits; token bị mask có giá trị -inf
+        :return: (B, L, H, W) logits; token bị mask nhận NEG_INF
         """
         v = F.normalize(self.v_proj(feat), dim=1)                     # (B, P, H, W)
         t = F.normalize(self.t_proj(text_emb), dim=-1)                # (B, L, P)
 
         sim = torch.einsum('bphw,blp->blhw', v, t) * self.logit_scale.exp().clamp(max=100.0)
-        return sim.masked_fill(~text_mask[:, :, None, None], float('-inf'))
+        return sim.masked_fill(~text_mask[:, :, None, None], NEG_INF)
+
+    def token_weights(self, sim, text_mask):
+        """α_pj: soft-select token tại từng pixel (hoặc one-hot khi mode='hard')."""
+        if self.mode == 'hard':
+            # Bản V1: chỉ token thắng mới đóng góp. Giữ lại để làm một arm của ablation.
+            hard = torch.zeros_like(sim)
+            return hard.scatter_(1, sim.argmax(dim=1, keepdim=True), 1.0)
+        return torch.softmax(sim / self.token_temperature, dim=1)
 
     def forward(self, feat, text_emb, text_mask):
         """
         :param feat: (B, C, H, W)
         :param text_emb: (B, L, D)
         :param text_mask: (B, L) bool, True ở token nội dung
-        :return: (B, 1, H, W) logits alignment (max theo token)
+        :return: (align_logits (B,1,H,W), region (B,R,H,W) hoặc None, α (B,L,H,W))
         """
         sim = self.per_token(feat, text_emb, text_mask)
-        logits = sim.max(dim=1).values                                # (B, H, W)
-        # Prompt rỗng (không còn token nào) -> -inf; đưa về 0 để loss không thành NaN.
-        logits = torch.nan_to_num(logits, neginf=0.0)
-        return logits.unsqueeze(1)
+        attn = self.token_weights(sim, text_mask)
+        logits = (attn * sim).sum(dim=1)                              # (B, H, W)
+
+        # Prompt mà mọi token đều bị loại (rỗng, hoặc toàn dấu câu): α vô nghĩa -> trả 0 để
+        # loss không bị kéo bởi NEG_INF và fusion không nhận nhiễu.
+        valid = text_mask.any(dim=1)
+        logits = torch.where(valid[:, None, None], logits, torch.zeros_like(logits))
+        attn = attn * valid[:, None, None, None]
+
+        region = None
+        if self.r_proj is not None:
+            r = self.r_proj(text_emb)                                 # (B, L, R)
+            region = torch.einsum('blhw,blr->brhw', attn, r)
+        return logits.unsqueeze(1), region, attn
+
+
+class RegionFusion(nn.Module):
+    """
+    F' = F + φ([F, F ⊙ A_T, R_T]).
+
+    Residual chứ không phải gate nhân: conv cuối khởi tạo 0 nên lúc bắt đầu F' = F đúng bằng
+    baseline, nhánh ngôn ngữ đi vào dần khi `A_T` bắt đầu có nghĩa. Gate `F ⊙ (1+λA_T)` của V1
+    thì ngay từ bước 0 đã nhân feature với một bản đồ ngẫu nhiên.
+    """
+
+    def __init__(self, feat_dim, region_dim=0):
+        super(RegionFusion, self).__init__()
+        self.conv1 = nn.Conv2d(2 * feat_dim + region_dim, feat_dim, kernel_size=1)
+        self.bn = nn.BatchNorm2d(feat_dim)
+        self.conv2 = nn.Conv2d(feat_dim, feat_dim, kernel_size=3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, feat, attention, region=None):
+        parts = [feat, feat * attention]
+        if region is not None:
+            parts.append(region)
+        return feat + self.conv2(F.relu(self.bn(self.conv1(torch.cat(parts, dim=1)))))
 
 
 def dice_loss(logits, target, eps=1.0):
@@ -154,31 +262,72 @@ class GenerativeResnetAlign(GenerativeResnet):
     """
 
     accepts_extras = True
+    # Tên trong inference/models/__init__.py -- utils/checkpoint.py dựng lại model từ đây.
+    network_name = 'grconvnet3_align'
+
+    # Giá trị của V1, dùng khi unpickle checkpoint cũ (xem __setstate__).
+    _V1_DEFAULTS = dict(align_mode='hard', fusion='gate', use_region_text=False,
+                        align_stage='bottleneck', gate_lambda=1.0, w_align=1.0)
 
     def __init__(self, input_channels=3, output_channels=1, channel_size=32, dropout=False,
-                 prob=0.0, use_text=True, proj_dim=128, gate_lambda=1.0,
-                 w_align=1.0, w_agnostic=1.0, text_encoder=None):
+                 prob=0.0, use_text=True, align_mode='soft', region_text=True,
+                 fusion='residual', align_stage='bottleneck', proj_dim=128, region_dim=64,
+                 token_temperature=1.0, gate_lambda=1.0, w_align=1.0, text_encoder=None):
+        """
+        :param align_mode: 'soft' = α_pj softmax theo token (V2); 'hard' = max theo token (V1)
+        :param region_text: đưa `R_T` vào decoder hay không
+        :param fusion: 'residual' = F + φ([F, F⊙A_T, R_T]); 'gate' = F ⊙ (1 + λ·A_T) như V1
+        :param align_stage: 'bottleneck' (56×56, sau res5) hoặc 'conv4' (113×113, sau conv4).
+                            Mức part khá nhỏ so với stride 4; nếu `A_T` mờ thì thử 'conv4'.
+        :param token_temperature: τ_t của softmax theo token. S đã được chia τ học được rồi,
+                                  nên τ_t chỉ điều chỉnh độ "nhọn" của việc chọn token.
+        :param text_encoder: dùng lại một CLIPTextEncoder có sẵn (tiết kiệm khi load nhiều model)
+        """
         super(GenerativeResnetAlign, self).__init__(
             input_channels=input_channels, output_channels=output_channels,
             channel_size=channel_size, dropout=dropout, prob=prob)
 
+        if fusion not in ('residual', 'gate'):
+            raise ValueError(f"fusion phải là 'residual' hoặc 'gate', nhận '{fusion}'")
+        if align_stage not in ('bottleneck', 'conv4'):
+            raise ValueError(
+                f"align_stage phải là 'bottleneck' hoặc 'conv4', nhận '{align_stage}'")
+
+        # Đủ để dựng lại model rỗng khi load checkpoint dạng state_dict (utils/checkpoint.py).
+        self.init_kwargs = dict(
+            input_channels=input_channels, output_channels=output_channels,
+            channel_size=channel_size, dropout=dropout, prob=prob, use_text=use_text,
+            align_mode=align_mode, region_text=region_text, fusion=fusion,
+            align_stage=align_stage, proj_dim=proj_dim, region_dim=region_dim,
+            token_temperature=token_temperature, gate_lambda=gate_lambda, w_align=w_align)
+
         self.use_text = use_text
+        self.align_mode = align_mode
+        self.use_region_text = bool(region_text)
+        self.fusion = fusion
+        self.align_stage = align_stage
         self.gate_lambda = gate_lambda
         self.w_align = w_align
-        self.w_agnostic = w_agnostic
+        # Bật bằng `with net.collecting_stats():` -- xem utils/diagnostics.py. Mặc định tắt để
+        # vòng train nóng không phải tính entropy/argmax trên (B, L, H, W) mỗi bước.
+        self.collect_stats = False
+        self.last_stats = {}
         # Warmup do vòng train set: 0 -> 1 để gradient của L_align không lấn lúc A_T còn ngẫu nhiên.
         self.register_buffer('loss_warmup', torch.tensor(1.0), persistent=False)
 
-        bottleneck = channel_size * 4
-        # Q_g: graspability không điều kiện text, supervise bằng M_union.
-        self.graspability_head = nn.Conv2d(bottleneck, 1, kernel_size=1)
-
         if use_text:
+            feat_dim = channel_size * 4 if align_stage == 'bottleneck' else channel_size * 2
             self.text_encoder = text_encoder if text_encoder is not None else CLIPTextEncoder()
-            self.align = TokenPixelAlignment(bottleneck, self.text_encoder.dim, proj_dim)
+            self.align = TokenRegionAlignment(
+                feat_dim, self.text_encoder.dim, proj_dim=proj_dim, region_dim=region_dim,
+                mode=align_mode, region_text=region_text,
+                token_temperature=token_temperature)
+            if fusion == 'residual':
+                self.fuse = RegionFusion(feat_dim, self.align.region_dim)
 
     # --------------------------------------------------------------- forward --
     def encode(self, x_in):
+        """conv1..res5 -> F ở bottleneck (56×56 với input 224)."""
         x = F.relu(self.bn1(self.conv1(x_in)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
@@ -189,38 +338,87 @@ class GenerativeResnetAlign(GenerativeResnet):
         x = self.res5(x)
         return x
 
-    def decode(self, x):
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = self.conv6(x)
-
+    def heads(self, x):
         if self.dropout:
             return (self.pos_output(self.dropout_pos(x)), self.cos_output(self.dropout_cos(x)),
                     self.sin_output(self.dropout_sin(x)), self.width_output(self.dropout_wid(x)))
         return (self.pos_output(x), self.cos_output(x),
                 self.sin_output(x), self.width_output(x))
 
+    def condition(self, feat, prompts):
+        """
+        Một lượt token-region alignment + fusion tại đúng feature map đang có.
+
+        :return: (F', align_logits) -- align_logits là None khi không có prompt
+        """
+        if not self.use_text or prompts is None:
+            return feat, None
+
+        text_emb, text_mask = self.text_encoder(prompts)
+        align_logits, region, attn = self.align(feat, text_emb.to(feat.dtype), text_mask)
+        attention = torch.sigmoid(align_logits)
+
+        if self.fusion == 'gate':
+            # Bản V1: gate nhân, không dùng R_T.
+            fused = feat * (1.0 + self.gate_lambda * attention)
+        else:
+            fused = self.fuse(feat, attention, region)
+
+        if self.collect_stats:
+            self.last_stats = self._forward_stats(feat, fused, attn, text_mask)
+        return fused, align_logits
+
+    def _forward_stats(self, feat, fused, attn, text_mask):
+        from utils.diagnostics import fusion_stats, token_stats, winning_tokens
+
+        stats = {f'token/{k}': v for k, v in token_stats(attn, text_mask).items()}
+        stats.update({f'fusion/{k}': v for k, v in fusion_stats(feat, fused).items()})
+        stats['token/logit_scale'] = float(self.align.logit_scale.exp())
+        stats['token/temperature'] = 1.0 / max(stats['token/logit_scale'], 1e-8)
+        # Giữ ở dạng tensor CPU: vòng train gộp lại rồi mới đổi sang tên token.
+        stats['_winning_tokens'] = winning_tokens(attn, text_mask).cpu()
+        stats['_text_mask'] = text_mask.cpu()
+        return stats
+
+    @contextlib.contextmanager
+    def collecting_stats(self):
+        """Bật thu thập chẩn đoán cho các forward bên trong khối `with`."""
+        previous = self.collect_stats
+        self.collect_stats = True
+        try:
+            yield self
+        finally:
+            self.collect_stats = previous
+
     def forward(self, x_in, prompts=None):
         """
-        :return: (pos, cos, sin, width, align_logits, graspability_logits); hai phần tử cuối là
-                 None khi không có text / không bật nhánh tương ứng.
+        :return: (pos, cos, sin, width, align_logits); phần tử cuối là None khi không có text.
         """
-        feat = self.encode(x_in)
-        graspability_logits = self.graspability_head(feat)
-
+        x = self.encode(x_in)
         align_logits = None
-        if self.use_text and prompts is not None:
-            text_emb, text_mask = self.text_encoder(prompts)
-            align_logits = self.align(feat, text_emb.to(feat.dtype), text_mask)
-            # Residual gating: A_T ≈ 0 lúc đầu vẫn cho gradient đi qua nhánh thị giác.
-            feat = feat * (1.0 + self.gate_lambda * torch.sigmoid(align_logits))
+        if self.align_stage == 'bottleneck':
+            x, align_logits = self.condition(x, prompts)
 
-        return self.decode(feat) + (align_logits, graspability_logits)
+        x = F.relu(self.bn4(self.conv4(x)))
+        if self.align_stage == 'conv4':
+            # Sau conv4 lưới là 113×113 (stride ~2): mịn gấp đôi cho part nhỏ, đổi lại
+            # conv1..res5 không còn được điều kiện bởi prompt.
+            x, align_logits = self.condition(x, prompts)
+
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = self.conv6(x)
+        return self.heads(x) + (align_logits,)
 
     # ------------------------------------------------------------------ loss --
-    def compute_loss(self, xc, yc, prompts=None, part_mask=None, union_pos=None):
+    def compute_loss(self, xc, yc, prompts=None, part_mask=None, **ignored):
+        """
+        L = L_grasp(Q_T, cos2θ, sin2θ, W) + w_align · warmup · [BCE + Dice](A_T, part_mask).
+
+        :param ignored: nuốt các key thừa của loader (vd `union_pos` từ bản V1) để không phải
+                        đổi loader khi đổi objective.
+        """
         y_pos, y_cos, y_sin, y_width = yc
-        pos_pred, cos_pred, sin_pred, width_pred, align_logits, grasp_logits = self(xc, prompts)
+        pos_pred, cos_pred, sin_pred, width_pred, align_logits = self(xc, prompts)
 
         losses = {
             'p_loss': F.smooth_l1_loss(pos_pred, y_pos),
@@ -229,31 +427,30 @@ class GenerativeResnetAlign(GenerativeResnet):
             'width_loss': F.smooth_l1_loss(width_pred, y_width),
         }
         loss = sum(losses.values())
-        warmup = float(self.loss_warmup)
 
         if align_logits is not None and part_mask is not None and self.w_align > 0:
             target = _match_resolution(part_mask, align_logits)
-            align = F.binary_cross_entropy_with_logits(align_logits, target) \
-                + dice_loss(align_logits, target)
-            losses['align_loss'] = align
-            loss = loss + self.w_align * warmup * align
-
-        if union_pos is not None and self.w_agnostic > 0:
-            target = _match_resolution(union_pos, grasp_logits)
-            agnostic = F.binary_cross_entropy_with_logits(grasp_logits, target)
-            losses['agnostic_loss'] = agnostic
-            loss = loss + self.w_agnostic * warmup * agnostic
+            # BCE trên logits, Dice sau sigmoid: part_mask chỉ chiếm ~2-5% pixel nên chỉ BCE
+            # thì nghiệm "toàn 0" đã đủ tốt. Log riêng hai thành phần: warmup làm tổng đi lên
+            # trong lúc từng phần đang đi xuống, nhìn tổng thôi thì đọc nhầm.
+            losses['align_bce'] = F.binary_cross_entropy_with_logits(align_logits, target)
+            losses['align_dice'] = dice_loss(align_logits, target)
+            loss = loss + self.lambda_align * (losses['align_bce'] + losses['align_dice'])
 
         pred = {'pos': pos_pred, 'cos': cos_pred, 'sin': sin_pred, 'width': width_pred}
         if align_logits is not None:
             pred['align'] = torch.sigmoid(align_logits)
-        pred['graspability'] = torch.sigmoid(grasp_logits)
-        return {'loss': loss, 'losses': losses, 'pred': pred}
+        return {'loss': loss, 'losses': losses, 'pred': pred,
+                'align_logits': align_logits, 'stats': dict(self.last_stats)}
+
+    @property
+    def lambda_align(self):
+        """Trọng số L_align *thực tế* của bước hiện tại (đã nhân warmup)."""
+        return self.w_align * float(self.loss_warmup)
 
     def predict(self, xc, prompts=None):
-        pos, cos, sin, width, align_logits, grasp_logits = self(xc, prompts)
-        out = {'pos': pos, 'cos': cos, 'sin': sin, 'width': width,
-               'graspability': torch.sigmoid(grasp_logits)}
+        pos, cos, sin, width, align_logits = self(xc, prompts)
+        out = {'pos': pos, 'cos': cos, 'sin': sin, 'width': width}
         if align_logits is not None:
             out['align'] = torch.sigmoid(align_logits)
         return out
@@ -264,31 +461,70 @@ class GenerativeResnetAlign(GenerativeResnet):
         Alignment token-pixel cho việc visualize.
 
         :return: dict
-            tokens     list[list[str]] -- token nội dung của từng prompt (đã bỏ SOT/EOT/pad)
-            maps       (B, L_i, H, W) similarity của từng token, đã chuẩn hoá về [0, 1]
-            attention  (B, 1, H, W) A_T = sigmoid(max theo token), chính thứ dùng để gate
+            tokens     list[list[str]] -- token nội dung của từng prompt (đã bỏ SOT/EOT/pad/dấu câu)
+            maps       list[(L_i, H, W)] similarity của từng token, đã chuẩn hoá về [0, 1]
+            weights    list[(L_i, H, W)] α_pj -- token nào được chọn tại pixel nào
+            attention  (B, 1, H, W) A_T = σ(Σ_j α_pj S_pj), chính thứ đưa vào fusion
         """
         if not self.use_text:
             raise RuntimeError('Model khởi tạo với use_text=False, không có nhánh alignment.')
 
         feat = self.encode(x_in)
+        if self.align_stage == 'conv4':
+            feat = F.relu(self.bn4(self.conv4(feat)))
         text_emb, text_mask = self.text_encoder(prompts)
-        sim = self.align.per_token(feat, text_emb.to(feat.dtype), text_mask)   # (B, L, H, W)
-        attention = torch.sigmoid(self.align(feat, text_emb.to(feat.dtype), text_mask))
+        text_emb = text_emb.to(feat.dtype)
+        sim = self.align.per_token(feat, text_emb, text_mask)          # (B, L, H, W)
+        align_logits, _, attn = self.align(feat, text_emb, text_mask)
 
         all_tokens = self.text_encoder.token_strings(prompts)
-        tokens, maps = [], []
+        tokens, maps, weights = [], [], []
         for b in range(sim.shape[0]):
             keep = text_mask[b].nonzero(as_tuple=True)[0]
             tokens.append([_clean_token(all_tokens[b][i]) for i in keep.tolist()])
-            m = sim[b, keep]                                                   # (L_i, H, W)
+            m = sim[b, keep]                                           # (L_i, H, W)
             lo, hi = m.amin(), m.amax()
             maps.append((m - lo) / (hi - lo + 1e-8))
-        return {'tokens': tokens, 'maps': maps, 'attention': attention}
+            weights.append(attn[b, keep])
+        return {'tokens': tokens, 'maps': maps, 'weights': weights,
+                'attention': torch.sigmoid(align_logits)}
 
     def set_loss_warmup(self, value):
         """Gọi mỗi epoch: 0 -> 1 trong vài epoch đầu."""
         self.loss_warmup.fill_(float(value))
+
+    # ------------------------------------------------------- tương thích V1 --
+    def __setstate__(self, state):
+        """
+        Checkpoint V1 là `torch.save(net)`, tức pickle cả object -- nó không mang những thuộc
+        tính V2 thêm vào (`fusion`, `align_mode`, ...). Điền giá trị V1 vào để checkpoint cũ
+        (hard-max + gate) vẫn chạy đúng như lúc train dưới code V2.
+        """
+        super(GenerativeResnetAlign, self).__setstate__(state)
+        for name, value in self._V1_DEFAULTS.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+        if not hasattr(self, 'init_kwargs'):
+            self.init_kwargs = None
+        # `align` của V1 là TokenPixelAlignment (không có .mode/.r_proj); pickle giữ nguyên
+        # trọng số nhưng class đã đổi tên -> chỉ vá thuộc tính còn thiếu.
+        align = getattr(self, 'align', None)
+        if align is not None:
+            if not hasattr(align, 'mode'):
+                align.mode = 'hard'
+            if not hasattr(align, 'r_proj'):
+                align.r_proj = None
+            if not hasattr(align, 'token_temperature'):
+                align.token_temperature = 1.0
+        if hasattr(self, 'graspability_head'):
+            # V2 bỏ Q_g; giữ tham số trong object thì vô hại, nhưng không ai đọc nó nữa.
+            logging.getLogger(__name__).info(
+                'Checkpoint V1: bỏ qua graspability_head (V2 không dùng Q_g).')
+
+
+# `TokenPixelAlignment` là tên class của V1. Pickle lưu theo tên module + tên class, nên alias
+# này là thứ giữ cho `torch.load` một checkpoint V1 không chết vì AttributeError.
+TokenPixelAlignment = TokenRegionAlignment
 
 
 def _clean_token(token):
@@ -298,8 +534,8 @@ def _clean_token(token):
 
 def _match_resolution(target, like):
     """
-    Hạ target (224×224) xuống đúng lưới của A_T / Q_g (56×56) thay vì upsample logits lên --
-    supervise ở resolution thật của feature map, không tạo độ chính xác giả.
+    Hạ target (224×224) xuống đúng lưới của A_T thay vì upsample logits lên -- supervise ở
+    resolution thật của feature map, không tạo độ chính xác giả.
     """
     if target.shape[-2:] == like.shape[-2:]:
         return target
