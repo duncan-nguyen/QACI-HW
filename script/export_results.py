@@ -195,9 +195,16 @@ def main():
     # -------------------------------------------------------------- log ----
     print("\nchép log:")
     for src in filter(None, [args.train_log, args.config] + list(args.eval_logs)):
-        if os.path.isfile(src):
-            shutil.copy(src, os.path.join(args.out, os.path.basename(src)))
-            print(f"  {os.path.basename(src)}")
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(args.out, os.path.basename(src))
+        # Runner có thể đã `tee` thẳng train.log vào --out; shutil.copy lên chính nó ném
+        # SameFileError và giết cả pipeline ở stage cuối cùng.
+        if os.path.abspath(src) == os.path.abspath(dst):
+            print(f"  {os.path.basename(src)} (đã ở đúng chỗ)")
+            continue
+        shutil.copy(src, dst)
+        print(f"  {os.path.basename(src)}")
     if args.tensorboard_dir and os.path.isdir(args.tensorboard_dir):
         dest = os.path.join(args.out, "tensorboard")
         shutil.rmtree(dest, ignore_errors=True)
