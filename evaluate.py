@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import inspect
 import logging
 import time
 
@@ -14,6 +16,14 @@ from utils.visualisation.plot import save_results
 logging.basicConfig(level=logging.INFO)
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def eval_extras(net, batch, device):
     """Phần tử thứ 6 (prompt/part_mask/union_pos) của Grasp-Anything++; xem train_network.py."""
     if len(batch) < 6 or not getattr(net, "accepts_extras", False):
@@ -22,7 +32,7 @@ def eval_extras(net, batch, device):
     kwargs = {}
     if "prompt" in extra:
         kwargs["prompts"] = extra["prompt"]
-    for key in ("part_mask", "union_pos"):
+    for key in ("part_mask", "union_pos", "align_weight"):
         if key in extra:
             kwargs[key] = extra[key].to(device)
     return kwargs
@@ -93,6 +103,13 @@ def parse_args():
         "--iou-eval", action="store_true", help="Compute success based on IoU metric."
     )
     parser.add_argument(
+        "--align-eval",
+        action="store_true",
+        help="Đo luôn chất lượng A_T (IoU/Dice với part_mask, fg vs bg, token thắng có phải "
+        "từ chỉ part). Cần nạp part_mask nên chậm hơn; không bật thì loader bỏ qua "
+        "part_mask/M_union và evaluation nhanh hơn đáng kể.",
+    )
+    parser.add_argument(
         "--jacquard-output", action="store_true", help="Jacquard-dataset style output"
     )
 
@@ -150,6 +167,13 @@ if __name__ == "__main__":
     # Chỉ truyền khi có, vì các loader khác (cornell/jacquard/...) không nhận kwarg này.
     if args.split_path:
         ds_kwargs["split_path"] = args.split_path
+    # Metric IoU chỉ cần pos/cos/sin/width. Nạp part_mask và dựng M_union (đọc N file .pt cho
+    # mỗi sample) là phần lớn thời gian mỗi sample -- bỏ đi khi không đo alignment.
+    if not args.align_eval:
+        params = inspect.signature(Dataset.__init__).parameters
+        for key in ("include_mask", "include_union"):
+            if key in params:
+                ds_kwargs[key] = False
     test_dataset = Dataset(args.dataset_path, **ds_kwargs)
 
     indices = list(range(test_dataset.length))
@@ -160,6 +184,14 @@ if __name__ == "__main__":
     val_indices = indices[split:]
     val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
     logging.info(f"Validation size: {len(val_indices)}")
+    logging.info(
+        "Eval split: seen=%s split_frac=%s shuffle=%s augment=%s indices_sha256=%s",
+        args.seen,
+        args.split,
+        args.ds_shuffle,
+        args.augment,
+        hashlib.sha256(",".join(map(str, val_indices)).encode()).hexdigest()[:16],
+    )
 
     test_data = torch.utils.data.DataLoader(
         test_dataset, batch_size=1, num_workers=args.num_workers, sampler=val_sampler
@@ -171,8 +203,21 @@ if __name__ == "__main__":
 
         # Load Network
         net = torch.load(network, map_location=device, weights_only=False)
+        # Bản cũ tin rằng checkpoint được lưu sau validate() nên đã ở eval mode. Một checkpoint
+        # lưu giữa lúc train sẽ được đánh giá với dropout bật mà không có cảnh báo nào.
+        was_training = net.training
+        net.eval()
+        logging.info(
+            "checkpoint training_mode_on_load=%s -> eval(); sha256=%s",
+            was_training,
+            sha256_file(network),
+        )
+        if args.align_eval and hasattr(net, "set_collect_stats"):
+            net.set_collect_stats(True)
 
         results = {"correct": 0, "failed": 0}
+        align_stats, align_n = {}, 0
+        token_part, token_punct, token_n, token_batches = 0.0, 0.0, 0, 0
 
         if args.jacquard_output:
             jo_fn = network + "_jacquard_output.txt"
@@ -186,13 +231,33 @@ if __name__ == "__main__":
                 x, y, didx, rot, zoom = batch[:5]
                 xc = x.to(device)
                 yc = [yi.to(device) for yi in y]
-                lossd = net.compute_loss(xc, yc, **eval_extras(net, batch, device))
+                extras = eval_extras(net, batch, device)
+                lossd = net.compute_loss(xc, yc, **extras)
+                pred = lossd["pred"]
+
+                if args.align_eval:
+                    for sn, sv in lossd.get("stats", {}).items():
+                        align_stats[sn] = align_stats.get(sn, 0.0) + float(sv)
+                    align_n += 1
+                    # `accepts_extras` vẫn True khi use_text=0 (baseline no-text) nên prompts
+                    # vẫn có mặt, nhưng nhánh alignment thì không tồn tại.
+                    if (
+                        "prompts" in extras
+                        and getattr(net, "use_text", False)
+                        and hasattr(net, "align_token_report")
+                    ):
+                        rep = net.align_token_report(xc, extras["prompts"])
+                        if rep["n"]:
+                            token_n += rep["n"]
+                            token_part += rep["part_frac"] * rep["n"]
+                        token_punct += rep["punct_frac"]
+                        token_batches += 1
 
                 q_img, ang_img, width_img = post_process_output(
-                    lossd["pred"]["pos"],
-                    lossd["pred"]["cos"],
-                    lossd["pred"]["sin"],
-                    lossd["pred"]["width"],
+                    pred["pos"],
+                    pred["cos"],
+                    pred["sin"],
+                    pred["width"],
                 )
 
                 if args.iou_eval:
@@ -241,6 +306,23 @@ if __name__ == "__main__":
                     results["correct"] + results["failed"],
                     results["correct"] / (results["correct"] + results["failed"]),
                 )
+            )
+
+        if align_n:
+            # Chất lượng A_T -- loss không nói lên nó có hoạt động hay không. fg ≈ bg nghĩa là
+            # gate vô dụng; argmax_last cao nghĩa là token thắng luôn là token cuối câu.
+            logging.info(
+                "ALIGN Results: %s",
+                " ".join(
+                    f"{n}={v / align_n:.4f}" for n, v in sorted(align_stats.items())
+                ),
+            )
+        if token_batches:
+            logging.info(
+                "TOKEN Results: argmax_is_part=%.4f argmax_is_punct=%.4f n=%d",
+                token_part / token_n if token_n else 0.0,
+                token_punct / token_batches,
+                token_n,
             )
 
         if args.jacquard_output:

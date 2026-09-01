@@ -113,16 +113,17 @@ def plot_prompt_comparison(net, x, prompts, size=224):
     return fig
 
 
-def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, axes=None):
+def grasp_probe(net, dataset, idx, no_grasps=1, iou_threshold=0.25):
     """
-    Grasp dự đoán cạnh ground truth, cùng bản đồ Q và A_T.
+    Chạy model trên một sample và trả kết quả *không vẽ hình*.
+
+    Tách khỏi `plot_grasp_prediction` để chọn mẫu (đạt/trượt) trước khi render: render đắt hơn
+    inference nhiều lần.
 
     Success được tính đúng như `evaluation.calculate_iou_match`: `Grasp.max_iou` trả 0 khi lệch
     góc quá 30 độ, nên `max_iou > 0.25` gói trọn cả hai điều kiện của metric trong paper.
 
-    :param dataset: GraspAnythingPPDataset
-    :param idx: index trong dataset
-    :return: (fig, dict với iou/success/prompt)
+    :return: dict với x/rot/zoom/prompt/pred/q_img/ang_img/width_img/grasps/gt/iou/success
     """
     from inference.post_process import post_process_output
     from utils.dataset_processing.grasp import detect_grasps
@@ -140,7 +141,27 @@ def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, ax
     grasps = detect_grasps(q_img, ang_img, width_img=width_img, no_grasps=no_grasps)
     gt = dataset.get_gtbb(idx, rot, zoom)
     best_iou = max((g.max_iou(gt) for g in grasps), default=0.0)
-    success = best_iou > iou_threshold
+    return {"x": x, "prompt": prompt, "pred": pred, "q_img": q_img, "ang_img": ang_img,
+            "width_img": width_img, "grasps": grasps, "gt": gt,
+            "iou": float(best_iou), "success": bool(best_iou > iou_threshold),
+            "n_grasps": len(grasps)}
+
+
+def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, axes=None,
+                          probe=None):
+    """
+    Grasp dự đoán cạnh ground truth, cùng bản đồ Q và A_T.
+
+    :param dataset: GraspAnythingPPDataset
+    :param idx: index trong dataset
+    :param probe: kết quả `grasp_probe` đã tính sẵn, để khỏi chạy inference hai lần
+    :return: (fig, dict với iou/success/prompt)
+    """
+    p = probe or grasp_probe(net, dataset, idx, no_grasps, iou_threshold)
+    x, prompt, pred = p["x"], p["prompt"], p["pred"]
+    q_img, ang_img = p["q_img"], p["ang_img"]
+    grasps, gt = p["grasps"], p["gt"]
+    best_iou, success = p["iou"], p["success"]
 
     n_panel = 3 + int("align" in pred)
     if axes is None:

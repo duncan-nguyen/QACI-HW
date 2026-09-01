@@ -50,6 +50,8 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         include_mask=True,
         include_union=True,
         split_path=None,
+        align_weight_path=None,
+        single_part_weight=1.0,
         **kwargs,
     ):
         """
@@ -117,6 +119,65 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         if ds_rotate:
             split = int(self.length * ds_rotate)
             self.grasp_files = self.grasp_files[split:] + self.grasp_files[:split]
+
+        self.align_weights, self.align_weight_summary = self._load_align_weights(
+            align_weight_path, single_part_weight
+        )
+
+    # --------------------------------------------------- trọng số alignment --
+    DEFAULT_ALIGN_WEIGHTS = "align_weights.npz"
+
+    def _load_align_weights(self, path, single_part_weight):
+        """
+        Nạp d_i = 1 - IoU(part_mask_i, hợp mask mọi part cùng object), do
+        `script/build_align_weights.py` tính sẵn.
+
+        d_i đo "biết part nào thì thu hẹp được vùng bao nhiêu". Bằng 0 nghĩa là mask của part
+        bằng cả object -- target không phân biệt part, nên `L_align` trên sample đó dạy model
+        *bất biến theo part*, ngược hẳn luận điểm của method.
+
+        Trả về mảng float32 xếp theo đúng thứ tự self.grasp_files (đã lọc split), không giữ
+        dict: dict 880k khoá sẽ phá copy-on-write khi fork DataLoader worker và ngốn vài GB.
+
+        :return: (np.ndarray hoặc None, dict tóm tắt để log)
+        """
+        path = path or os.path.join(self.file_path, self.DEFAULT_ALIGN_WEIGHTS)
+        if not os.path.isfile(path):
+            return None, {"source": None}
+
+        blob = np.load(path, allow_pickle=False)
+        lookup = dict(zip(blob["ids"].tolist(), blob["d"].tolist()))
+        n_parts = dict(zip(blob["ids"].tolist(), blob["n_parts"].tolist()))
+
+        weights = np.ones(len(self.grasp_files), dtype=np.float32)
+        multi, single, missing = [], 0, 0
+        for i, f in enumerate(self.grasp_files):
+            sid = self._sample_id(f)
+            if sid not in lookup:
+                missing += 1
+                continue
+            if n_parts[sid] < 2:
+                # Object một part: d_i không xác định (hợp bằng chính nó). Không có bằng chứng
+                # để loại, nên giữ nguyên trọng số và đếm riêng.
+                weights[i] = single_part_weight
+                single += 1
+            else:
+                weights[i] = lookup[sid]
+                multi.append(lookup[sid])
+
+        summary = {
+            "source": path,
+            "n_samples": len(self.grasp_files),
+            "n_missing": missing,
+            "n_single_part": single,
+            "n_multi_part": len(multi),
+            # Con số quyết định: trung bình d_i trên các object có ≥2 part. Gần 0 nghĩa là
+            # part_mask của dataset ở mức object và L_align không dạy được grounding part.
+            "mean_d_multi_part": float(np.mean(multi)) if multi else float("nan"),
+            "mean_weight_all": float(weights.mean()),
+            "single_part_weight": single_part_weight,
+        }
+        return weights, summary
 
     # ------------------------------------------------------------------ split --
     @staticmethod
@@ -296,4 +357,6 @@ class GraspAnythingPPDataset(GraspDatasetBase):
             extra["union_pos"] = self.numpy_to_torch(
                 self.get_union_pos(idx, rot, zoom_factor)
             )
+        if self.align_weights is not None:
+            extra["align_weight"] = float(self.align_weights[idx])
         return sample + (extra,)
