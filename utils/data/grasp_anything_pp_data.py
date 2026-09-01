@@ -9,11 +9,11 @@ from utils.dataset_processing import grasp, image
 
 from .grasp_data import GraspDatasetBase
 
-# Ảnh và part_mask của Grasp-Anything luôn là 416x416.
+# Grasp-Anything images and part_masks are always 416x416.
 SOURCE_SIZE = 416
 
-# Thứ tự tìm split nếu người dùng không chỉ định: split riêng cho GA++ trước, không có thì
-# dùng tạm split object-level của base GA.
+# Search order when no split is given: the GA++-specific split first, otherwise fall back to
+# the object-level split of the base GA.
 SPLIT_DIRS = (
     os.path.join("split", "grasp-anything-pp"),
     os.path.join("split", "grasp-anything"),
@@ -22,23 +22,24 @@ SPLIT_DIRS = (
 
 class GraspAnythingPPDataset(GraspDatasetBase):
     """
-    Dataset wrapper cho Grasp-Anything++ (language-driven grasping).
+    Dataset wrapper for Grasp-Anything++ (language-driven grasping).
 
-    Khác Grasp-Anything gốc ở ba chỗ:
+    Three differences from the original Grasp-Anything:
 
-    * một sample là (scene, object, part), tên file `<scene_id>_<object_idx>_<part_idx>` --
-      *ba* phần, không phải hai. `scene_id` là SHA-256 của ảnh nên không chứa '_', bóc hậu tố
-      bằng `rsplit` là an toàn.
-    * prompt nằm ở `grasp_instructions/`, mỗi file là một `str` ("Lift apple by its skin.").
-      Đây không phải `scene_description/` của base GA -- cái đó là tuple (caption, [tên object])
-      mô tả cả scene, không nhắm vào part nào.
-    * có thêm `part_mask/`: mask nhị phân 416x416 uint8 của đúng part mà prompt nói tới.
+    * a sample is (scene, object, part), with filename `<scene_id>_<object_idx>_<part_idx>` --
+      *three* parts, not two. `scene_id` is the SHA-256 of the image, so it contains no '_' and
+      stripping suffixes with `rsplit` is safe.
+    * prompts live in `grasp_instructions/`, one `str` per file ("Lift apple by its skin.").
+      This is not the base GA's `scene_description/`, which is a tuple (caption, [object names])
+      describing the whole scene and targeting no particular part.
+    * there is an extra `part_mask/`: a 416x416 uint8 binary mask of exactly the part the
+      prompt refers to.
 
-    Layout `grasp_label_positive/*.pt` thì giống hệt base GA -- float32 (N, 6) mỗi hàng là
-    `[q, x, y, w, h, theta_deg]` -- nên `GraspRectangles.load_from_grasp_anything_file` dùng lại
-    được nguyên vẹn. Cột `q` là điểm antipodal T~ = (cos a1 + cos a2) / R của paper LGD (§3.2);
-    `q > 0` là grasp dương, phần còn lại nằm ở `grasp_label_negative/`. `_grasp_anything_format`
-    bỏ qua cột này.
+    The `grasp_label_positive/*.pt` layout is identical to the base GA -- float32 (N, 6), each
+    row `[q, x, y, w, h, theta_deg]` -- so `GraspRectangles.load_from_grasp_anything_file` is
+    reused as is. The `q` column is the antipodal score T~ = (cos a1 + cos a2) / R of the LGD
+    paper (Sec. 3.2); `q > 0` marks a positive grasp, the rest live in `grasp_label_negative/`.
+    `_grasp_anything_format` ignores this column.
     """
 
     def __init__(
@@ -54,22 +55,23 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         **kwargs,
     ):
         """
-        :param file_path: Thư mục Grasp-Anything++ (chứa image/, grasp_instructions/,
+        :param file_path: Grasp-Anything++ directory (holding image/, grasp_instructions/,
                           grasp_label_positive/, part_mask/).
-        :param ds_rotate: Xoay vòng danh sách sample theo tỉ lệ này trước khi chia tập.
-        :param seen: Lấy split seen (True) hay unseen (False).
-        :param include_prompt: Trả kèm prompt gắp.
-        :param include_mask: Trả kèm part_mask (đã chịu cùng rot/zoom với ảnh).
-        :param include_union: Trả kèm M_union -- hợp grasp của mọi part cùng object. Mặc định
-                              tắt: V2 bỏ nhánh Q_g/L_agnostic, mà dựng M_union phải đọc và vẽ
-                              lại grasp của *mọi* part cùng object (~4,4 lần công việc) cho
-                              một target không ai dùng. Bật lại nếu cần cho phân tích.
-        :param split_path: Thư mục split tự chọn; mặc định dò theo SPLIT_DIRS.
-        :param prompt_tokenizer: callable str -> dict tensor (`PromptTokenizer`). Có thì prompt
-                                 được tokenize ngay trong worker và `extra["prompt"]` trả về
-                                 dict thay vì str -- gỡ 6,3 ms/batch khỏi tiến trình chính.
-                                 None = trả str như cũ.
-        :param kwargs: kwargs của GraspDatasetBase.
+        :param ds_rotate: Rotate the sample list by this fraction before splitting.
+        :param seen: Use the seen (True) or unseen (False) split.
+        :param include_prompt: Also return the grasp instruction.
+        :param include_mask: Also return part_mask (under the same rot/zoom as the image).
+        :param include_union: Also return M_union -- the union of grasps over all parts of the
+                              same object. Off by default: the model has no unconditional
+                              graspability branch, and building M_union means reading and
+                              re-drawing the grasps of *every* part of the object (~4.4x the
+                              work) for a target nobody consumes. Turn it back on for analysis.
+        :param split_path: Custom split directory; defaults to searching SPLIT_DIRS.
+        :param prompt_tokenizer: callable str -> dict of tensors (`PromptTokenizer`). When set,
+                                 prompts are tokenized inside the worker and `extra["prompt"]`
+                                 additionally carries a dict -- taking 6.3 ms/batch off the
+                                 main process. None = return plain strings.
+        :param kwargs: kwargs of GraspDatasetBase.
         """
         super().__init__(seen=seen, **kwargs)
 
@@ -87,20 +89,20 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         missing = [d for d in required if not os.path.isdir(os.path.join(file_path, d))]
         if missing:
             raise FileNotFoundError(
-                "Thiếu thư mục {} trong {}. Tải bằng script/download_grasp_anything_pp.sh.".format(
+                "Missing directory {} in {}. Download it with "
+                "script/download_grasp_anything_pp.sh.".format(
                     ", ".join(missing), file_path
                 )
             )
 
-        # grasp_files là nguồn duy nhất để đánh index; mọi path khác derive từ nó, vì một ảnh
-        # dùng chung cho nhiều sample part-level và bộ lọc split chỉ áp lên grasp_files.
+        # grasp_files is the single source of indexing; every other path is derived from it,
+        # because one image is shared by several part-level samples and the split filter is
+        # applied to grasp_files only.
         self.grasp_files = sorted(
             glob.glob(os.path.join(file_path, "grasp_label_positive", "*.pt"))
         )
         if not self.grasp_files:
-            raise FileNotFoundError(
-                f"Không thấy file .pt nào. Kiểm tra path: {file_path}"
-            )
+            raise FileNotFoundError(f"No .pt files found. Check the path: {file_path}")
 
         split_ids = self._load_split(split_path, seen)
         self.grasp_files = [
@@ -108,17 +110,17 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         ]
         if not self.grasp_files:
             raise FileNotFoundError(
-                'Split {} không khớp sample nào. Id GA++ là "<scene>_<object>_<part>" còn '
-                'split/grasp-anything/*.obj là "<scene>_<object>" -- kiểm tra lại split_path.'.format(
+                'Split {} matched no samples. GA++ ids are "<scene>_<object>_<part>" while '
+                'split/grasp-anything/*.obj holds "<scene>_<object>" -- check split_path.'.format(
                     "seen" if seen else "unseen"
                 )
             )
 
         self.length = len(self.grasp_files)
 
-        # Nhóm sample theo object để dựng M_union. Chỉ gom từ self.grasp_files (đã lọc split),
-        # nên union không bao giờ kéo category của split kia vào target -- union mọi file trên
-        # đĩa mới là leak.
+        # Group samples by object to build M_union. Only self.grasp_files (already filtered by
+        # split) is scanned, so the union never pulls a category from the other split into the
+        # target -- unioning every file on disk would be a leak.
         self._files_by_object = defaultdict(list)
         for f in self.grasp_files:
             self._files_by_object[self._object_id(self._sample_id(f))].append(f)
@@ -127,7 +129,7 @@ class GraspAnythingPPDataset(GraspDatasetBase):
             split = int(self.length * ds_rotate)
             self.grasp_files = self.grasp_files[split:] + self.grasp_files[:split]
 
-        # None = prompt thật. shuffle_prompts()/set_fixed_prompt() đổi hai cờ này.
+        # None = real prompts. shuffle_prompts()/set_fixed_prompt() change these two flags.
         self._prompt_perm = None
         self._fixed_prompt = None
 
@@ -141,32 +143,32 @@ class GraspAnythingPPDataset(GraspDatasetBase):
                 with open(path, "rb") as f:
                     return set(pickle.load(f))
         raise FileNotFoundError(
-            "Không tìm thấy {} trong {}".format(
-                split_file, split_path or " hoặc ".join(SPLIT_DIRS)
+            "Could not find {} in {}".format(
+                split_file, split_path or " or ".join(SPLIT_DIRS)
             )
         )
 
     @classmethod
     def _in_split(cls, sample_id, split_ids):
         """
-        Split của GA++ có thể là part-level, của base GA thì là object-level -- nhận cả hai.
+        GA++ splits may be part-level while base GA splits are object-level -- accept both.
         """
         return sample_id in split_ids or cls._object_id(sample_id) in split_ids
 
     # --------------------------------------------------------------------- id --
     @staticmethod
     def _sample_id(grasp_file):
-        """ "<scene_id>_<object_idx>_<part_idx>" -- một cặp (ảnh, object, part)."""
+        """ "<scene_id>_<object_idx>_<part_idx>" -- one (image, object, part) triple."""
         return os.path.splitext(os.path.basename(grasp_file))[0]
 
     @staticmethod
     def _object_id(sample_id):
-        """ "<scene_id>_<object_idx>" -- khoá của split base GA."""
+        """ "<scene_id>_<object_idx>" -- the key used by the base GA split."""
         return sample_id.rsplit("_", 1)[0]
 
     @staticmethod
     def _scene_id(sample_id):
-        """ "<scene_id>" -- khoá của image/, mọi part của cùng scene dùng chung ảnh này."""
+        """ "<scene_id>" -- the key into image/; all parts of a scene share this image."""
         return sample_id.rsplit("_", 2)[0]
 
     def sample_id(self, idx):
@@ -189,8 +191,9 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     # ------------------------------------------------------------------- data --
     def get_gtbb(self, idx, rot=0, zoom=1.0):
-        # validate() trong train_network.py truyền rot/zoom lấy thẳng từ batch (tensor 1 phần
-        # tử), np.cos() của tensor sẽ ra mảng và làm hỏng ma trận xoay -> ép về float.
+        # validate() in train_network.py passes rot/zoom straight from the batch (1-element
+        # tensors); np.cos() of a tensor yields an array and corrupts the rotation matrix ->
+        # coerce to float.
         rot, zoom = float(rot), float(zoom)
         gtbbs = grasp.GraspRectangles.load_from_grasp_anything_file(
             self.grasp_files[idx], scale=self.output_size / float(SOURCE_SIZE)
@@ -203,19 +206,20 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     def get_depth(self, idx, rot=0, zoom=1.0):
         raise NotImplementedError(
-            "Grasp-Anything++ chỉ có RGB; train với --use-depth 0."
+            "Grasp-Anything++ is RGB only; train with --use-depth 0."
         )
 
     def _augment(self, img, rot, zoom):
         """
         crop(zoom) -> resize(output_size) -> rotate.
 
-        Thứ tự gốc của repo là rotate -> zoom -> resize, tức là hai phép nội suy đắt nhất chạy
-        ở 416x416 rồi mới hạ xuống 224 -- tốn gấp ~3,4 lần số pixel mà kết quả không khác.
-        Với góc xoay bội số 90° (đúng những góc `random_rotate` sinh ra) thì crop tâm và xoay
-        giao hoán, nên đảo thứ tự là tương đương về hình học.
+        The upstream order is rotate -> zoom -> resize, i.e. the two most expensive
+        interpolations run at 416x416 before dropping to 224 -- ~3.4x the pixels for an
+        identical result. For rotations by multiples of 90° (exactly what `random_rotate`
+        produces), the centre crop and the rotation commute, so reordering is geometrically
+        equivalent.
 
-        :param img: image.Image, sẽ bị sửa tại chỗ
+        :param img: image.Image, modified in place
         """
         if zoom != 1.0:
             h, w = img.img.shape[0], img.img.shape[1]
@@ -238,13 +242,13 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     def get_prompt(self, idx, use_permutation=True):
         """
-        Câu lệnh gắp của sample này, ví dụ "Lift apple by its skin.".
+        The grasp instruction of this sample, e.g. "Lift apple by its skin.".
 
-        Sau `shuffle_prompts()` thì trả prompt của một sample *khác* -- ảnh giữ nguyên, câu
-        lệnh thành sai. Xem docstring ở đó.
+        After `shuffle_prompts()` this returns the prompt of a *different* sample -- the image
+        is unchanged, the instruction is wrong. See that docstring.
 
-        :param use_permutation: False để lấy prompt thật kể cả khi đang bật hoán vị (để so
-                                sánh hai bên trên cùng một sample, xem
+        :param use_permutation: False to get the real prompt even while the permutation is
+                                active (to compare both on the same sample, see
                                 script/audit_text_reliance.py).
         """
         if self._fixed_prompt is not None:
@@ -253,37 +257,39 @@ class GraspAnythingPPDataset(GraspDatasetBase):
             idx = int(self._prompt_perm[idx])
         with open(self.get_prompt_file(idx), "rb") as f:
             prompt = pickle.load(f)
-        # GA++ lưu một str thuần, nhưng vài file cũ gói trong list/tuple.
+        # GA++ stores a bare str, but a few older files wrap it in a list/tuple.
         if not isinstance(prompt, str):
             prompt = prompt[0]
         return prompt
 
     def shuffle_prompts(self, seed=0):
         """
-        Ghép ảnh với prompt của sample khác -- phép đối chứng cho câu hỏi "model có *thật sự*
-        đọc prompt không".
+        Pair each image with another sample's prompt -- the counterfactual for "does the model
+        *actually* read the prompt".
 
-        Nếu accuracy gần như không đổi khi prompt bị hoán vị thì nhánh ngôn ngữ không đóng góp
-        gì: model chỉ đang đoán grasp trung bình của ảnh. Đây là control âm bắt buộc cho một
-        method language-driven, và rẻ hơn nhiều so với train lại một arm no-text.
+        If accuracy barely moves when prompts are permuted, the language branch contributes
+        nothing: the model is just predicting the image's average grasp. This is the mandatory
+        negative control for a language-driven method, and far cheaper than retraining an
+        image-only arm.
 
-        Hoán vị được vá để không sample nào giữ nguyên prompt của chính nó *và* không nhận
-        prompt của một part khác cùng object (prompt cùng object vẫn nói về đúng vật đó, làm
-        control yếu đi).
+        The permutation is patched so that no sample keeps its own prompt *and* none receives
+        the prompt of another part of the same object (a same-object prompt still names the
+        right object, which weakens the control).
 
-        `part_mask` và grasp label **không** bị hoán vị: chúng vẫn là ground truth của ảnh,
-        nên `align_loss` đo lúc này chính là mức lệch do prompt sai gây ra.
+        `part_mask` and the grasp labels are **not** permuted: they remain the image's ground
+        truth, so the `align_loss` measured here is exactly the error caused by the wrong prompt.
 
-        :param seed: seed để tái lập đúng phép hoán vị
-        :return: self (tiện gọi nối)
+        :param seed: seed that makes the permutation reproducible
+        :return: self (for chaining)
         """
         rng = np.random.default_rng(seed)
         n = len(self.grasp_files)
         perm = rng.permutation(n)
         objects = [self._object_id(self._sample_id(f)) for f in self.grasp_files]
 
-        # Một lượt vá: chỗ nào tự ghép vào chính object mình thì đổi với một vị trí ngẫu nhiên
-        # khác. Dataset thật có hàng trăm nghìn object nên số lần đụng là rất nhỏ.
+        # One repair pass: wherever a sample is paired with its own object, swap it with a
+        # random other position. Real datasets have hundreds of thousands of objects, so
+        # collisions are rare.
         for i in range(n):
             if objects[perm[i]] != objects[i]:
                 continue
@@ -298,11 +304,11 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     def set_fixed_prompt(self, prompt):
         """
-        Một prompt duy nhất cho *mọi* ảnh -- đối chứng thứ hai.
+        A single prompt for *every* image -- the second counterfactual.
 
-        Hoán vị prompt vẫn đưa vào model một câu đúng ngữ pháp, đúng phân phối; prompt cố định
-        thì lấy đi cả thông tin lẫn sự đa dạng. Nếu accuracy không tụt kể cả ở đây thì nhánh
-        ngôn ngữ chắc chắn không đóng góp gì.
+        A permuted prompt still hands the model a grammatical, in-distribution sentence; a
+        fixed prompt removes both the information and the variety. If accuracy does not drop
+        even here, the language branch certainly contributes nothing.
 
         :return: self
         """
@@ -310,26 +316,27 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         return self
 
     def real_prompts(self):
-        """Bỏ hoán vị / prompt cố định, quay lại prompt thật."""
+        """Drop the permutation / fixed prompt and go back to the real prompts."""
         self._prompt_perm = None
         self._fixed_prompt = None
         return self
 
     def get_part_mask(self, idx, rot=0, zoom=1.0):
         """
-        Mask nhị phân của part được prompt nhắc tới, đã qua *đúng* chuỗi biến đổi của get_rgb
-        (rotate -> zoom -> resize) để alignment loss không học lệch.
+        Binary mask of the part the prompt refers to, put through *exactly* the same transform
+        chain as get_rgb (rotate -> zoom -> resize) so the alignment loss is not learned
+        misaligned.
         """
         rot, zoom = float(rot), float(zoom)
         mask_img = image.Image(self._load_mask(idx).astype(np.float32))
         self._augment(mask_img, rot, zoom)
-        # Nội suy làm mask hết nhị phân -> ngưỡng lại.
+        # Interpolation makes the mask non-binary -> threshold it again.
         return (mask_img.img > 0.5).astype(np.float32)
 
     def _load_mask(self, idx):
         """
-        part_mask 416x416 uint8. Chấp nhận cả bản đóng gói bit (mảng 1 chiều 21.632 byte) --
-        `script/build_ga_pp_subset.py --pack-masks` lưu kiểu đó, nhỏ hơn 8 lần trên đĩa.
+        416x416 uint8 part_mask. Also accepts the bit-packed form (a flat 21,632-byte array)
+        written by `script/build_ga_pp_subset.py --pack-masks`, 8x smaller on disk.
         """
         mask = np.load(self.get_mask_file(idx))
         if mask.ndim == 1:
@@ -340,8 +347,9 @@ class GraspAnythingPPDataset(GraspDatasetBase):
 
     def get_union_gtbb(self, idx, rot=0, zoom=1.0):
         """
-        Hợp grasp rectangle của *mọi* part thuộc cùng object -- target cho nhánh graspability
-        không điều kiện text (trả lời "cầm được ở đâu", bất kể prompt nói part nào).
+        Union of the grasp rectangles of *every* part of the same object -- the target for a
+        text-independent graspability branch (answering "where can this be held", regardless of
+        which part the prompt names).
         """
         rot, zoom = float(rot), float(zoom)
         grs = []
@@ -358,7 +366,7 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         return gtbbs
 
     def get_union_pos(self, idx, rot=0, zoom=1.0):
-        """M_union dưới dạng bản đồ [0, 1] cùng kích thước output."""
+        """M_union as a [0, 1] map at the output resolution."""
         pos_img, _, _ = self.get_union_gtbb(idx, rot, zoom).draw(
             (self.output_size, self.output_size)
         )
@@ -369,14 +377,15 @@ class GraspAnythingPPDataset(GraspDatasetBase):
         if not (self.include_prompt or self.include_mask or self.include_union):
             return sample
 
-        # rot/zoom lấy từ chính sample vừa trả về, để prompt/mask khớp với ảnh và grasp label.
+        # rot/zoom come from the sample just returned, so prompt/mask match the image and labels.
         _, _, _, rot, zoom_factor = sample
         extra = {}
         if self.include_prompt:
             extra["prompt"] = self.get_prompt(idx)
-            # Tokenize ở đây = tokenize trong worker. `default_collate` gộp dict tensor thành
-            # (B, L) và `CLIPTextEncoder` nhận thẳng. Chuỗi gốc vẫn giữ ở key "prompt" vì
-            # utils/visualisation/alignment.py và evaluate.py đọc nó dưới dạng str.
+            # Tokenizing here means tokenizing in the worker. `default_collate` stacks the
+            # tensor dicts into (B, L) and `CLIPTextEncoder` takes them directly. The raw
+            # string stays under the "prompt" key, because utils/visualisation/alignment.py and
+            # evaluate.py read it as a str.
             if self.prompt_tokenizer is not None:
                 extra["prompt_tokens"] = self.prompt_tokenizer(extra["prompt"])
         if self.include_mask:

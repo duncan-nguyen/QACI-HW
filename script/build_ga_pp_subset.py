@@ -1,17 +1,19 @@
-"""Dựng một subset Grasp-Anything++ đủ dùng để train, không cần tải 150 GB.
+"""Build a Grasp-Anything++ subset large enough to train on, without downloading 150 GB.
 
-Cách làm:
+How it works:
 
-1. Tải 4 zip nhỏ (~10.6 GB): 3 thư mục label của GA++ + `scene_description` của base repo.
-2. Chọn ngẫu nhiên-nhưng-xác-định một tập scene bằng hash tên scene. Vì hash chỉ phụ thuộc
-   tên, cả 4 zip chọn ra **cùng** tập scene mà không cần so danh sách.
-3. Trích ra *mọi* sample của những scene đó. Lấy trọn scene (chứ không phải sample rời) là
-   bắt buộc: `M_∪` cần mọi part của cùng một object, lấy sample rời thì union suy biến thành
-   chính part đó.
-4. Ảnh nằm trong archive 65 GB nên không tải; đọc thẳng từng file cần qua HTTP range.
+1. Download 4 small zips (~10.6 GB): GA++'s 3 label directories + `scene_description` from the
+   base repo.
+2. Pick a random-but-deterministic set of scenes by hashing the scene name. Because the hash
+   depends only on the name, all 4 zips select the **same** scenes without comparing lists.
+3. Extract *every* sample of those scenes. Taking whole scenes (rather than individual samples)
+   is required: `M_union` needs every part of the same object, and with loose samples the union
+   degenerates into that single part.
+4. The images live in a 65 GB archive, so they are not downloaded; each needed file is read
+   directly over an HTTP range request.
 
-Kết quả có layout đúng như `GraspAnythingPPDataset` mong đợi, chạy tiếp
-`split/build_grasp_anything_pp.py` là train được.
+The result has exactly the layout `GraspAnythingPPDataset` expects; run
+`split/build_grasp_anything_pp.py` next and it is ready to train.
 
     python script/build_ga_pp_subset.py --out data/ga-pp-subset --scenes 2000
 """
@@ -32,7 +34,7 @@ HF = "https://huggingface.co/datasets/{repo}/resolve/main/{name}"
 REPO_BASE = "airvlab/Grasp-Anything"
 REPO_PP = "airvlab/Grasp-Anything-pp"
 
-# zip cần tải hẳn về (nhỏ) -> (repo, tên file, thư mục bên trong, đuôi)
+# Zips small enough to download in full -> (repo, filename, inner directory, extension)
 LOCAL_ZIPS = [
     (REPO_PP, "grasp_instructions.zip", "grasp_instructions", ".pkl"),
     (REPO_PP, "grasp_label_positive.zip", "grasp_label_positive", ".pt"),
@@ -40,16 +42,16 @@ LOCAL_ZIPS = [
     (REPO_BASE, "scene_description.zip", "scene_description", ".pkl"),
 ]
 
-TOTAL_SCENES = 994_860  # dùng để ước lượng khi chưa quét xong
+TOTAL_SCENES = 994_860  # used to estimate progress before the scan completes
 
 
-# ------------------------------------------------------------------ zip đọc --
+# --------------------------------------------------------------- zip reading --
 def parse_eocd(read_at, size):
-    """(n_entries, cd_size, cd_offset). Mọi archive ở đây đều ZIP64."""
+    """(n_entries, cd_size, cd_offset). Every archive here is ZIP64."""
     tail = read_at(max(0, size - 65536), size - 1)
     i = tail.rfind(b"PK\x05\x06")
     if i < 0:
-        raise ValueError("không thấy End Of Central Directory")
+        raise ValueError("End Of Central Directory not found")
     n, cd_size, cd_off = struct.unpack("<HII", tail[i + 10 : i + 20])
     j = tail.rfind(b"PK\x06\x07")
     if j >= 0:
@@ -80,7 +82,7 @@ def zip64_fix(extra, csize, usize, lho):
 
 
 def iter_central_dir(read_at, size, chunk=16 << 20):
-    """Yield (name, offset, csize, method) cho từng entry, đọc theo chunk để khỏi ngốn RAM."""
+    """Yield (name, offset, csize, method) per entry, read in chunks to keep RAM down."""
     n_entries, cd_size, cd_off = parse_eocd(read_at, size)
     end, pos, buf = cd_off + cd_size, cd_off, b""
     while pos < end:
@@ -115,8 +117,8 @@ def read_member(read_at, offset, csize, method):
 
 
 def local_reader_multi(paths):
-    """Như local_reader nhưng cho archive bị chẻ nhiều part (image_part_aa + ab), map offset
-    logic sang (file, offset thật) mà không phải nối 65 GB lại."""
+    """Like local_reader but for an archive split into several parts (image_part_aa + ab),
+    mapping a logical offset onto (file, real offset) without concatenating 65 GB."""
     handles = [open(p, "rb") for p in paths]
     sizes = [os.path.getsize(p) for p in paths]
     lock = threading.Lock()
@@ -148,8 +150,8 @@ def local_reader(path):
 
 
 class RemoteReader:
-    """Đọc range trên HuggingFace. Giữ session và URL CDN đã resolve -- mỗi request mới mà
-    phải đi lại redirect thì chậm gấp đôi."""
+    """Range reads against HuggingFace. Keeps the session and the resolved CDN URL -- a request
+    that has to follow the redirect again is twice as slow."""
 
     def __init__(self, repo, *names):
         self.session = requests.Session()
@@ -163,7 +165,7 @@ class RemoteReader:
         self.size = sum(self.sizes)
 
     def read_at(self, a, b):
-        """Range trên archive logic (các part nối lại)."""
+        """A range on the logical archive (the parts joined end to end)."""
         out, base = b"", 0
         for url, n in zip(self.urls, self.sizes):
             lo, hi = base, base + n - 1
@@ -176,7 +178,7 @@ class RemoteReader:
         return out
 
 
-# ------------------------------------------------------------------ tải zip --
+# ------------------------------------------------------------------ download --
 def download(repo, name, dest):
     if os.path.isfile(dest):
         print(f"  [skip ] {name} ({os.path.getsize(dest) / 1e9:.2f} GB)")
@@ -205,9 +207,9 @@ def download(repo, name, dest):
     os.rename(tmp, dest)
 
 
-# ------------------------------------------------------------------- chọn ----
+# -------------------------------------------------------------- selection ----
 def pack_mask(payload):
-    """part_mask nhị phân 416x416 uint8 -> mảng bit đóng gói (173 KB -> 21 KB)."""
+    """A binary 416x416 uint8 part_mask -> a bit-packed array (173 KB -> 21 KB)."""
     import io
 
     import numpy as np
@@ -220,13 +222,14 @@ def pack_mask(payload):
 
 def write_atomic(dest, payload):
     """
-    Ghi qua file tạm rồi `os.replace`.
+    Write through a temp file, then `os.replace`.
 
-    Ghi thẳng vào đích thì một lần đứt mạng/Ctrl-C giữa chừng để lại file cụt, mà lần chạy
-    sau chỉ kiểm tra `os.path.isfile` nên sẽ bỏ qua nó -- JPEG hỏng đi thẳng vào training và
-    không báo lỗi ở đâu cả. `os.replace` là atomic trên cùng một filesystem.
+    Writing straight to the destination means one dropped connection or Ctrl-C leaves a
+    truncated file behind, and the next run only checks `os.path.isfile` and skips it -- a
+    corrupt JPEG goes straight into training with no error anywhere. `os.replace` is atomic
+    within one filesystem.
     """
-    # Đuôi khác `.part` của download() để hai cơ chế không bao giờ giẫm lên nhau.
+    # A different suffix from download()'s `.part`, so the two mechanisms never collide.
     tmp = dest + ".tmp"
     with open(tmp, "wb") as f:
         f.write(payload)
@@ -234,7 +237,7 @@ def write_atomic(dest, payload):
 
 
 def keeps_scene(scene, every):
-    """Chọn xác định theo hash: cùng `every` thì mọi archive chọn ra cùng tập scene."""
+    """Deterministic hash selection: with the same `every`, every archive picks the same scenes."""
     return int(hashlib.md5(scene.encode()).hexdigest()[:8], 16) % every == 0
 
 
@@ -245,20 +248,21 @@ def scene_of(name):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default="data/ga-pp-subset", help="Thư mục subset")
+    p.add_argument("--out", default="data/ga-pp-subset", help="Subset directory")
     p.add_argument("--zips-dir", default=None,
-                   help="Nơi chứa/tải các zip (mặc định <out>/_archives)")
-    p.add_argument("--scenes", type=int, default=2000, help="Số scene muốn giữ (xấp xỉ)")
-    p.add_argument("--workers", type=int, default=16, help="Số luồng tải ảnh")
+                   help="Where the zips are stored/downloaded (default <out>/_archives)")
+    p.add_argument("--scenes", type=int, default=2000, help="Approximate number of scenes to keep")
+    p.add_argument("--workers", type=int, default=16, help="Threads used to fetch images")
     p.add_argument("--skip-images", action="store_true",
-                   help="Bỏ bước tải ảnh (khi ảnh đã có sẵn)")
+                   help="Skip fetching images (when they are already present)")
     p.add_argument("--images-from-zip", action="store_true",
-                   help="Tải hẳn image_part_aa+ab (65 GB) rồi trích ảnh từ đĩa, thay vì đọc "
-                        "từng ảnh qua HTTP. Đáng dùng khi > ~40k scene.")
+                   help="Download image_part_aa+ab in full (65 GB) and extract images from "
+                        "disk, instead of reading each image over HTTP. Worth it above ~40k "
+                        "scenes.")
     p.add_argument("--pack-masks", action="store_true",
-                   help="Lưu part_mask dưới dạng bit đóng gói: 21 KB thay vì 173 KB mỗi file "
-                        "(nhỏ hơn 8 lần, loader tự nhận ra). Bật khi subset lớn.")
-    p.add_argument("--keep-zips", action="store_true", help="Giữ lại zip sau khi trích")
+                   help="Store part_mask bit-packed: 21 KB instead of 173 KB per file (8x "
+                        "smaller, the loader detects it automatically). Use for large subsets.")
+    p.add_argument("--keep-zips", action="store_true", help="Keep the zips after extraction")
     return p.parse_args()
 
 
@@ -268,13 +272,13 @@ def main():
     zips_dir = args.zips_dir or os.path.join(out, "_archives")
     os.makedirs(zips_dir, exist_ok=True)
 
-    print("== 1/4  tải label zip (~10.6 GB, chỉ một lần) ==")
+    print("== 1/4  downloading label zips (~10.6 GB, once) ==")
     for repo, name, _, _ in LOCAL_ZIPS:
         download(repo, name, os.path.join(zips_dir, name))
 
-    print("\n== 2/4  trích subset ==")
+    print("\n== 2/4  extracting the subset ==")
     every = max(1, round(TOTAL_SCENES / max(1, args.scenes)))
-    print(f"  giữ 1 trong mỗi {every} scene (mục tiêu ~{args.scenes:,} scene)")
+    print(f"  keeping 1 scene in every {every} (target ~{args.scenes:,} scenes)")
 
     scenes = set()
     for repo, name, folder, ext in LOCAL_ZIPS:
@@ -302,34 +306,34 @@ def main():
                 print(f"\r  {folder:22} {n_kept:>8,} file", end="")
         print(f"\r  {folder:22} {n_kept:>8,} file")
 
-    print(f"\n  {len(scenes):,} scene được chọn")
+    print(f"\n  {len(scenes):,} scenes selected")
     if not scenes:
-        raise SystemExit("Không chọn được scene nào -- thử --scenes lớn hơn.")
+        raise SystemExit("No scene was selected -- try a larger --scenes.")
 
     if args.skip_images:
-        print("\n== 3/4  bỏ qua ảnh (--skip-images) ==")
+        print("\n== 3/4  skipping images (--skip-images) ==")
     elif args.images_from_zip:
-        print(f"\n== 3/4  tải archive ảnh (65 GB) rồi trích {len(scenes):,} ảnh ==")
+        print(f"\n== 3/4  downloading the image archive (65 GB), extracting {len(scenes):,} images ==")
         fetch_images_from_zip(scenes, os.path.join(out, "image"), zips_dir)
     else:
-        print(f"\n== 3/4  tải {len(scenes):,} ảnh qua HTTP range (không tải 65 GB) ==")
+        print(f"\n== 3/4  fetching {len(scenes):,} images over HTTP range (no 65 GB download) ==")
         fetch_images(scenes, os.path.join(out, "image"), args.workers)
 
-    print("\n== 4/4  xong ==")
+    print("\n== 4/4  done ==")
     for folder in sorted(os.listdir(out)):
         path = os.path.join(out, folder)
         if os.path.isdir(path) and not folder.startswith("_"):
             print(f"  {folder:22} {len(os.listdir(path)):>8,} file")
     if not args.keep_zips:
         shutil.rmtree(zips_dir, ignore_errors=True)
-        print(f"  (đã xoá {zips_dir}; --keep-zips để giữ lại)")
-    print(f"\nTiếp: python split/build_grasp_anything_pp.py --data-dir {out}")
+        print(f"  (removed {zips_dir}; use --keep-zips to keep it)")
+    print(f"\nNext: python split/build_grasp_anything_pp.py --data-dir {out}")
 
 
 def fetch_images_from_zip(scenes, target, zips_dir):
-    """Tải image_part_aa + ab về rồi trích các ảnh cần. Với subset lớn thì rẻ hơn hẳn đọc
-    từng ảnh qua HTTP: 65 GB tải một lần là chuyện băng thông, còn ~550 ms/ảnh là chuyện
-    latency và không co lại theo băng thông."""
+    """Download image_part_aa + ab, then extract the needed images. For large subsets this is
+    far cheaper than reading each image over HTTP: 65 GB downloaded once is a bandwidth
+    question, whereas ~550 ms per image is latency and does not shrink with bandwidth."""
     os.makedirs(target, exist_ok=True)
     parts = []
     for name in ("image_part_aa", "image_part_ab"):
@@ -339,7 +343,7 @@ def fetch_images_from_zip(scenes, target, zips_dir):
 
     read_at, size = local_reader_multi(parts)
     need = {s for s in scenes if not os.path.isfile(os.path.join(target, s + ".jpg"))}
-    print(f"  quét central directory ({size / 1e9:.0f} GB)...")
+    print(f"  scanning the central directory ({size / 1e9:.0f} GB)...")
     done = 0
     for name, off, csize, method in iter_central_dir(read_at, size):
         scene = os.path.splitext(os.path.basename(name))[0]
@@ -349,27 +353,27 @@ def fetch_images_from_zip(scenes, target, zips_dir):
                      read_member(read_at, off, csize, method))
         done += 1
         if done % 500 == 0:
-            print(f"\r  {done:,}/{len(need):,} ảnh", end="")
-    print(f"\r  {done:,}/{len(need):,} ảnh")
+            print(f"\r  {done:,}/{len(need):,} images", end="")
+    print(f"\r  {done:,}/{len(need):,} images")
 
 
 def fetch_images(scenes, target, workers):
     os.makedirs(target, exist_ok=True)
     need = {s for s in scenes if not os.path.isfile(os.path.join(target, s + ".jpg"))}
     if not need:
-        print("  ảnh đã có đủ")
+        print("  all images already present")
         return
 
     reader = RemoteReader(REPO_BASE, "image_part_aa", "image_part_ab")
-    print(f"  quét central directory của image.zip ({reader.size / 1e9:.0f} GB archive)...")
+    print(f"  scanning image.zip's central directory ({reader.size / 1e9:.0f} GB archive)...")
     entries = {}
     for name, off, csize, method in iter_central_dir(reader.read_at, reader.size):
         scene = os.path.splitext(os.path.basename(name))[0]
         if scene in need:
             entries[scene] = (off, csize, method)
-    print(f"  khớp {len(entries):,}/{len(need):,} scene")
+    print(f"  matched {len(entries):,}/{len(need):,} scenes")
 
-    # Mỗi luồng một RemoteReader riêng: requests.Session không an toàn khi dùng chung.
+    # One RemoteReader per thread: requests.Session is not safe to share.
     local = threading.local()
 
     def grab(item):
@@ -384,8 +388,8 @@ def fetch_images(scenes, target, workers):
         for _ in pool.map(grab, entries.items()):
             done += 1
             if done % 50 == 0:
-                print(f"\r  {done:,}/{len(entries):,} ảnh", end="")
-    print(f"\r  {done:,}/{len(entries):,} ảnh")
+                print(f"\r  {done:,}/{len(entries):,} images", end="")
+    print(f"\r  {done:,}/{len(entries):,} images")
 
 
 if __name__ == "__main__":

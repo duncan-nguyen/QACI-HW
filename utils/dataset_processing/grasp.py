@@ -7,13 +7,14 @@ from skimage.feature import peak_local_max
 
 cv2.setNumThreads(0)
 
-# `cv2.fillConvexPoly` tô cả pixel mà cạnh đi qua, còn `skimage.draw.polygon` chỉ lấy pixel có
-# *tâm* nằm trong đa giác -- chênh đúng nửa pixel dọc mỗi cạnh. Thu hình chữ nhật vào 0,5 px
-# mỗi phía trước khi tô thì bù lại được: sai khác còn 2,7% diện tích (thay vì 16%), lệch trung
-# bình -1,2 px trên một rect ~165 px. Đo trên 1.500 rect ngẫu nhiên cỡ GA++.
+# `cv2.fillConvexPoly` fills every pixel an edge passes through, while `skimage.draw.polygon`
+# only takes pixels whose *centre* lies inside the polygon -- exactly half a pixel along each
+# edge. Insetting the rectangle by 0.5 px per side before filling compensates: the difference
+# drops to 2.7% of the area (from 16%), a mean offset of -1.2 px on a ~165 px rect. Measured on
+# 1,500 random GA++-sized rectangles.
 _FILL_INSET = 0.5
-# Toạ độ đưa vào cv2 ở dạng fixed-point 1/32 px; thiếu bước này thì vertex bị làm tròn về số
-# nguyên và sai khác tăng gấp đôi.
+# Coordinates are handed to cv2 as 1/32-px fixed point; without this the vertices are rounded
+# to integers and the difference doubles.
 _FILL_SHIFT = 5
 
 
@@ -253,15 +254,17 @@ class GraspRectangles:
 
     def _compact_geometry(self):
         """
-        Bản vector hoá của `GraspRectangle.{center, angle, length, width}` cho *cả* danh sách.
+        A vectorised form of `GraspRectangle.{center, angle, length, width}` for the *whole* list.
 
-        Bản cũ đọc bốn property đó qua vòng `for` Python, mỗi property lại gọi arctan2/sqrt
-        trên hai số vô hướng -- riêng phần này chiếm ~40% thời gian `draw()`. Công thức giữ
-        nguyên từng chữ, kể cả `.astype(int)` (cắt về 0, không làm tròn) của `center`.
+        The original reads those four properties through a Python `for` loop, each property
+        calling arctan2/sqrt on two scalars -- that alone accounted for ~40% of `draw()`. The
+        formulas are preserved literally, including `center`'s `.astype(int)` (truncation
+        towards zero, not rounding).
 
-        :return: (poly, angle, length) -- `poly` là (N, 4, 2) toạ độ [y, x] của hình chữ nhật
-                 thu gọn (1/3 chiều dài) đã trừ `_FILL_INSET`; `angle`/`length` là của rect gốc
-                 vì đó mới là giá trị đi vào ang_out/width_out.
+        :return: (poly, angle, length) -- `poly` is (N, 4, 2) of [y, x] coordinates for the
+                 shrunk rectangle (1/3 of the length) with `_FILL_INSET` subtracted;
+                 `angle`/`length` are those of the original rect, since those are the values
+                 that go into ang_out/width_out.
         """
         pts = np.stack([gr.points for gr in self.grs]).astype(float)
 
@@ -274,7 +277,7 @@ class GraspRectangles:
         wdx = pts[:, 2, 0] - pts[:, 1, 0]
         rect_width = np.sqrt(wdx**2 + wdy**2)
 
-        # `Grasp(centre, angle, length / 3, width).as_gr`, vector hoá.
+        # `Grasp(centre, angle, length / 3, width).as_gr`, vectorised.
         half_l = np.maximum(length / 3.0 - 2 * _FILL_INSET, 1e-3) / 2.0
         half_w = np.maximum(rect_width - 2 * _FILL_INSET, 1e-3) / 2.0
         xo, yo = np.cos(angle), np.sin(angle)
@@ -296,11 +299,12 @@ class GraspRectangles:
         """
         Plot all GraspRectangles as solid rectangles in a numpy array, e.g. as network training data.
 
-        Tô bằng `cv2.fillConvexPoly` thay `skimage.draw.polygon`: 0,005 ms so với 0,034 ms mỗi
-        rect. Với ~30 rect một sample thì `draw()` đi từ 1,55 ms xuống ~0,3 ms -- sau khi
-        `Image.resize/rotate` đã chuyển sang cv2, đây là khoản còn lại lớn nhất của loader.
+        Filled with `cv2.fillConvexPoly` instead of `skimage.draw.polygon`: 0.005 ms versus
+        0.034 ms per rect. At ~30 rects per sample, `draw()` goes from 1.55 ms to ~0.3 ms --
+        once `Image.resize/rotate` moved to cv2, this was the loader's largest remaining cost.
 
-        Thứ tự ghi đè giữ nguyên: rect sau đè lên rect trước, y như vòng lặp cũ.
+        The overwrite order is preserved: later rects paint over earlier ones, as in the
+        original loop.
 
         :param shape: output shape
         :param position: If True, Q output will be produced
@@ -316,7 +320,7 @@ class GraspRectangles:
             return pos_out, ang_out, width_out
 
         poly, gr_angle, gr_length = self._compact_geometry()
-        # cv2 nhận (x, y) nên đảo trục, rồi sang fixed-point.
+        # cv2 takes (x, y), so swap the axes, then convert to fixed point.
         quads = np.round(poly[:, :, ::-1] * (1 << _FILL_SHIFT)).astype(np.int32)
 
         for i in range(len(quads)):
@@ -443,9 +447,10 @@ class GraspRectangle:
         try:
             r_max = max(rr1.max(), rr2.max()) + 1
             c_max = max(cc1.max(), cc2.max()) + 1
-            # Grasp sát mép ảnh (hoặc bị đẩy ra ngoài bởi zoom) có toạ độ âm. Đánh index âm
-            # vào canvas sẽ wrap-around về cuối mảng và tạo giao cắt không có thật, nên phải
-            # dịch cả hai polygon về gốc 0 trước khi vẽ.
+            # Grasps at the image border (or pushed outside by zoom) have negative
+            # coordinates. Indexing the canvas with a negative value wraps around to the end of
+            # the array and creates a phantom intersection, so both polygons must be shifted to
+            # origin 0 before drawing.
             r_min = min(rr1.min(), rr2.min(), 0)
             c_min = min(cc1.min(), cc2.min(), 0)
         except:

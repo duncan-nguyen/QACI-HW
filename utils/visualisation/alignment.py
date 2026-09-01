@@ -1,8 +1,8 @@
-"""Vẽ bản đồ alignment token-pixel của GenerativeResnetAlign.
+"""Plot the token-pixel alignment maps of STAG.
 
-Ý tưởng cốt lõi của method là *token văn bản nào* ăn với *vùng ảnh nào*. Module này lấy
-`net.token_alignment(...)` rồi trải ra thành một hàng hình: ảnh gốc, part_mask ground truth,
-A_T tổng hợp, và một ô cho mỗi token nội dung của prompt.
+The core idea of the method is *which text token* matches *which image region*. This module
+takes `net.token_alignment(...)` and lays it out as a row of panels: the source image, the
+ground-truth part_mask, the aggregated A_T, and one panel per content token of the prompt.
 """
 import warnings
 
@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 
 
 def _to_hw(tensor, size):
-    """(H, W) hoặc (1, H, W) -> ndarray (size, size) đã upsample bilinear."""
+    """(H, W) or (1, H, W) -> a (size, size) ndarray, bilinearly upsampled."""
     t = tensor.detach().float()
     while t.dim() < 4:
         t = t.unsqueeze(0)
@@ -24,7 +24,7 @@ def _to_hw(tensor, size):
 
 
 def _rgb_for_show(rgb):
-    """Ảnh của dataset đã normalise (zero-centred float) -> đưa về [0, 1] để imshow."""
+    """Dataset images are normalised (zero-centred float) -> map back to [0, 1] for imshow."""
     img = rgb.detach().cpu().numpy() if torch.is_tensor(rgb) else np.asarray(rgb)
     if img.ndim == 3 and img.shape[0] == 3:
         img = img.transpose(1, 2, 0)
@@ -35,15 +35,15 @@ def _rgb_for_show(rgb):
 
 def plot_token_alignment(net, x, prompt, part_mask=None, max_tokens=8, size=224, axes=None):
     """
-    Vẽ alignment của một sample.
+    Plot the alignment of a single sample.
 
-    :param net: GenerativeResnetAlign (đã .eval())
-    :param x: (3, H, W) hoặc (1, 3, H, W) -- input đúng như dataset trả về
-    :param prompt: câu lệnh gắp (str)
+    :param net: STAG (already in .eval())
+    :param x: (3, H, W) or (1, 3, H, W) -- the input exactly as the dataset returns it
+    :param prompt: the grasp instruction (str)
     :param part_mask: (1, H, W) ground truth, optional
-    :param max_tokens: số token vẽ nhiều nhất (chọn theo activation cực đại giảm dần)
-    :param axes: list axes có sẵn; None thì tự tạo figure
-    :return: (fig, thứ tự token đã vẽ kèm activation cực đại)
+    :param max_tokens: how many tokens to draw at most (by descending peak activation)
+    :param axes: existing list of axes; None creates a new figure
+    :return: (fig, the drawn token order with their peak activations)
     """
     if x.dim() == 3:
         x = x.unsqueeze(0)
@@ -51,13 +51,14 @@ def plot_token_alignment(net, x, prompt, part_mask=None, max_tokens=8, size=224,
     out = net.token_alignment(x.to(device), [prompt])
 
     tokens, maps, attention = out["tokens"][0], out["maps"][0], out["attention"][0]
-    # Token nào "ăn" mạnh nhất thì vẽ trước -- đó chính là thứ ta muốn nhìn.
+    # Strongest-matching tokens first -- those are the ones worth looking at.
     peaks = maps.flatten(1).max(dim=1).values
     order = torch.argsort(peaks, descending=True)[:max_tokens].tolist()
 
     panels = [("image", None, None), ("A_T", _to_hw(attention, size), "jet")]
     if part_mask is not None:
-        # GT là nhị phân -> phủ đặc vùng part thay vì heatmap, nếu không nó chìm hẳn.
+        # The GT is binary -> fill the part region solidly rather than as a heatmap, otherwise
+        # it disappears.
         panels.insert(1, ("part_mask (GT)", _to_hw(part_mask, size), "mask"))
     panels += [(f"{tokens[i]}  ({peaks[i]:.2f})", _to_hw(maps[i], size), "jet") for i in order]
 
@@ -89,8 +90,8 @@ def plot_token_alignment(net, x, prompt, part_mask=None, max_tokens=8, size=224,
 
 def plot_prompt_comparison(net, x, prompts, size=224):
     """
-    Cùng một ảnh, đổi prompt -> A_T phải dịch chuyển. Đây là cách nhìn trực tiếp nhất xem
-    nhánh ngôn ngữ có thật sự điều khiển vùng chú ý hay không.
+    Same image, different prompts -> A_T must move. This is the most direct way to see whether
+    the language branch really steers the attended region.
     """
     if x.dim() == 3:
         x = x.unsqueeze(0)
@@ -115,14 +116,15 @@ def plot_prompt_comparison(net, x, prompts, size=224):
 
 def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, axes=None):
     """
-    Grasp dự đoán cạnh ground truth, cùng bản đồ Q và A_T.
+    The predicted grasp next to the ground truth, with the Q and A_T maps.
 
-    Success được tính đúng như `evaluation.calculate_iou_match`: `Grasp.max_iou` trả 0 khi lệch
-    góc quá 30 độ, nên `max_iou > 0.25` gói trọn cả hai điều kiện của metric trong paper.
+    Success is computed exactly as in `evaluation.calculate_iou_match`: `Grasp.max_iou` returns
+    0 when the angular error exceeds 30 degrees, so `max_iou > 0.25` captures both conditions of
+    the paper's metric.
 
     :param dataset: GraspAnythingPPDataset
-    :param idx: index trong dataset
-    :return: (fig, dict với iou/success/prompt)
+    :param idx: index into the dataset
+    :return: (fig, dict with iou/success/prompt)
     """
     from inference.post_process import post_process_output
     from utils.dataset_processing.grasp import detect_grasps
@@ -155,15 +157,15 @@ def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, ax
         gr.plot(axes[0], color="lime")
     for g in grasps:
         g.plot(axes[0], color="red")
-    axes[0].set_title(f"GT (lục) vs dự đoán (đỏ)\nIoU={best_iou:.2f} "
-                      f"{'ĐẠT' if success else 'TRƯỢT'}", fontsize=9)
+    axes[0].set_title(f"GT (green) vs prediction (red)\nIoU={best_iou:.2f} "
+                      f"{'PASS' if success else 'FAIL'}", fontsize=9)
 
     axes[1].imshow(rgb)
     axes[1].imshow(q_img, cmap="jet", alpha=0.5, vmin=0.0, vmax=1.0)
     axes[1].set_title("Q (quality)", fontsize=9)
 
     axes[2].imshow(ang_img, cmap="hsv", vmin=-np.pi / 2, vmax=np.pi / 2)
-    axes[2].set_title("góc", fontsize=9)
+    axes[2].set_title("angle", fontsize=9)
 
     if "align" in pred:
         axes[3].imshow(rgb)
@@ -182,13 +184,13 @@ def plot_grasp_prediction(net, dataset, idx, no_grasps=1, iou_threshold=0.25, ax
 
 def plot_part_prompts(net, dataset, indices, size=224):
     """
-    Cùng một object, nhiều part khác nhau -- mỗi hàng một prompt: ground truth cạnh `A_T`.
+    One object, several different parts -- one prompt per row: ground truth beside `A_T`.
 
-    Đây là hình nói đúng luận điểm của method: đổi part trong câu lệnh thì vùng chú ý phải
-    dịch theo, dù ảnh không đổi.
+    This is the figure that states the method's claim: change the part named in the instruction
+    and the attended region must follow, even though the image is unchanged.
 
     :param dataset: GraspAnythingPPDataset
-    :param indices: các index cùng một object (xem `dataset._files_by_object`)
+    :param indices: indices belonging to the same object (see `dataset._files_by_object`)
     """
     device = next(net.parameters()).device
     rows = len(indices)
@@ -232,19 +234,20 @@ def _wrap(text, width):
     return lines + [line] if line else lines
 
 
-# ---------------------------------------------------------------- V2 debug --
-# Ba câu hỏi khi soi một run: token nào được chọn, vùng chọn có đúng không, và grasp có đổi
-# theo prompt không. Các hàm dưới đây trả lời lần lượt từng câu bằng hình.
+# -------------------------------------------------------------------- debug --
+# Three questions when inspecting a run: which token is selected, is the selected region
+# correct, and does the grasp change with the prompt. The functions below answer each of them
+# with a figure.
 
 TP_COLOR, FP_COLOR, FN_COLOR = (0.15, 0.85, 0.25), (0.90, 0.15, 0.15), (0.95, 0.85, 0.10)
 
 
 def _error_overlay(pred, gt):
     """
-    Mã màu sai/đúng của A_T: xanh = trúng, đỏ = báo nhầm, vàng = bỏ sót.
+    Colour-coded correctness of A_T: green = hit, red = false alarm, yellow = miss.
 
-    :param pred, gt: (H, W) ndarray nhị phân cùng kích thước
-    :return: (rgba (H, W, 4), chú thích)
+    :param pred, gt: (H, W) binary ndarrays of the same size
+    :return: (rgba (H, W, 4), caption)
     """
     pred, gt = pred > 0.5, gt > 0.5
     rgba = np.zeros(pred.shape + (4,), dtype=np.float32)
@@ -252,13 +255,13 @@ def _error_overlay(pred, gt):
         rgba[mask, :3] = color
         rgba[mask, 3] = 0.75
     inter, union = (pred & gt).sum(), (pred | gt).sum()
-    return rgba, f"IoU={inter / union:.2f}" if union else "mask rỗng"
+    return rgba, f"IoU={inter / union:.2f}" if union else "empty mask"
 
 
 def _top_tokens(out, b=0, k=4):
     """
-    Token mạnh nhất theo *attention mass* (trung bình alpha trên toàn ảnh), không phải theo
-    đỉnh similarity: mass mới là thứ quyết định R_T và là thứ so sánh được giữa các token.
+    Strongest tokens by *attention mass* (mean alpha over the image), not by peak similarity:
+    mass is what determines R_T and what is comparable across tokens.
 
     :return: list[(token, mass, map (H, W))]
     """
@@ -269,7 +272,7 @@ def _top_tokens(out, b=0, k=4):
 
 
 def _predict(net, x, prompt):
-    """Một forward -> (pred dict, q_img, ang_img, width_img)."""
+    """One forward pass -> (pred dict, q_img, ang_img, width_img)."""
     from inference.post_process import post_process_output
 
     device = next(net.parameters()).device
@@ -292,15 +295,16 @@ def _draw_grasps(ax, rgb, gt, grasps, title):
 def plot_sample_diagnostics(net, dataset, idx, prompt=None, k_tokens=4, size=224,
                             iou_threshold=0.25):
     """
-    Một hàng đầy đủ cho *một* sample:
+    A complete row for *one* sample:
 
-        RGB | part_mask GT | A_T | sai số alignment | Q | GT+dự đoán | k token mạnh nhất
+        RGB | part_mask GT | A_T | alignment error | Q | GT+prediction | k strongest tokens
 
-    Đây là hình để trả lời "lỗi nằm ở grounding hay ở grasp decoder": nếu A_T trúng mask mà
-    grasp vẫn trượt thì decoder là chỗ hỏng, không phải nhánh ngôn ngữ.
+    This is the figure that answers "is the fault in the grounding or in the grasp decoder": if
+    A_T hits the mask but the grasp still misses, the decoder is at fault, not the language
+    branch.
 
-    :param prompt: None = dùng prompt thật của sample
-    :return: (fig, dict thông tin)
+    :param prompt: None = use the sample's real prompt
+    :return: (fig, info dict)
     """
     from utils.dataset_processing.grasp import detect_grasps
 
@@ -342,18 +346,19 @@ def plot_sample_diagnostics(net, dataset, idx, prompt=None, k_tokens=4, size=224
         overlay, note = _error_overlay(at, gt_mask)
         axes[3].imshow(rgb)
         axes[3].imshow(overlay)
-        axes[3].set_title(f"sai số: xanh TP / đỏ FP / vàng FN\n{note}", fontsize=8)
+        axes[3].set_title(f"error: green TP / red FP / yellow FN\n{note}", fontsize=8)
     else:
         for ax in axes[2:4]:
             ax.imshow(rgb)
-            ax.set_title("(không có nhánh text)", fontsize=9)
+            ax.set_title("(no text branch)", fontsize=9)
 
     axes[4].imshow(rgb)
     axes[4].imshow(q_img, cmap="jet", alpha=0.5, vmin=0.0, vmax=1.0)
     axes[4].set_title(f"Q (max {q_img.max():.2f})", fontsize=9)
 
     _draw_grasps(axes[5], rgb, gt, grasps,
-                 f"GT (lục) / dự đoán (đỏ)\nIoU={best_iou:.2f} {'ĐẠT' if success else 'TRƯỢT'}")
+                 f"GT (green) / prediction (red)\nIoU={best_iou:.2f} "
+                 f"{'PASS' if success else 'FAIL'}")
 
     for ax, (token, mass, tmap) in zip(axes[6:], tokens):
         ax.imshow(rgb)
@@ -371,13 +376,13 @@ def plot_sample_diagnostics(net, dataset, idx, prompt=None, k_tokens=4, size=224
 
 def plot_prompt_grid(net, dataset, idx, prompts, size=224, k_tokens=3):
     """
-    Cùng một ảnh, nhiều prompt -- hình quan trọng nhất của idea này.
+    One image, several prompts -- the single most important figure for this idea.
 
-    Mỗi hàng: prompt | part_mask GT | A_T | top token | Q | grasp. Nếu đổi prompt mà A_T, top
-    token và grasp gần như không đổi thì model đang bỏ qua ngôn ngữ, bất kể align_loss thấp
-    đến đâu.
+    Each row: prompt | part_mask GT | A_T | top tokens | Q | grasp. If changing the prompt
+    leaves A_T, the top tokens and the grasp essentially unchanged, the model is ignoring the
+    language, however low align_loss got.
 
-    :param prompts: list[(nhãn, prompt)] hoặc list[str]
+    :param prompts: list[(label, prompt)] or list[str]
     """
     from utils.dataset_processing.grasp import detect_grasps
 
@@ -409,7 +414,7 @@ def plot_prompt_grid(net, dataset, idx, prompts, size=224, k_tokens=3):
         axes[r][2].axis("off")
         axes[r][2].text(0.02, 0.95, "\n".join(f"{t:<10s} {m:.2f}" for t, m, _ in tokens),
                         family="monospace", fontsize=9, va="top")
-        axes[r][2].set_title("token mạnh nhất" if r == 0 else "", fontsize=9)
+        axes[r][2].set_title("strongest tokens" if r == 0 else "", fontsize=9)
 
         axes[r][3].imshow(rgb)
         axes[r][3].imshow(q_img, cmap="jet", alpha=0.5, vmin=0.0, vmax=1.0)
@@ -429,13 +434,13 @@ def plot_prompt_grid(net, dataset, idx, prompts, size=224, k_tokens=3):
     return fig
 
 
-FAILURE_CLASSES = ("align đúng / grasp đúng", "align đúng / grasp sai",
-                   "align sai / grasp sai", "không phát hiện grasp")
+FAILURE_CLASSES = ("align ok / grasp ok", "align ok / grasp wrong",
+                   "align wrong / grasp wrong", "no grasp detected")
 
 
 def classify_failure(align_iou, grasp_iou, n_grasps, align_threshold=0.25,
                      grasp_threshold=0.25):
-    """Bốn nhóm để biết lỗi nằm ở grounding hay ở grasp decoder."""
+    """Four classes telling whether the fault lies in the grounding or the grasp decoder."""
     if n_grasps == 0:
         return 3
     if grasp_iou > grasp_threshold:
@@ -445,12 +450,12 @@ def classify_failure(align_iou, grasp_iou, n_grasps, align_threshold=0.25,
 
 def plot_failure_gallery(net, dataset, indices, per_class=2, size=224, iou_threshold=0.25):
     """
-    Gallery lỗi chia bốn nhóm (xem FAILURE_CLASSES).
+    Failure gallery split into four classes (see FAILURE_CLASSES).
 
-    Nhóm 2 nhiều -> nhánh grounding hỏng. Nhóm 1 nhiều -> grounding ổn mà decoder không dùng
-    được nó; đó là hai hướng sửa hoàn toàn khác nhau.
+    A large class 2 means the grounding branch is broken. A large class 1 means the grounding is
+    fine but the decoder cannot use it; those are two entirely different fixes.
 
-    :return: (fig hoặc None, đếm theo nhóm)
+    :return: (fig or None, per-class counts)
     """
     from utils.dataset_processing.grasp import detect_grasps
 
@@ -503,7 +508,7 @@ def plot_failure_gallery(net, dataset, indices, per_class=2, size=224, iou_thres
             ax.set_xticks([])
             ax.set_yticks([])
 
-    fig.suptitle("gallery lỗi: " + " · ".join(
+    fig.suptitle("failure gallery: " + " · ".join(
         f"[{i + 1}] {FAILURE_CLASSES[i]} {counts[i]}" for i in counts), fontsize=10)
     fig.tight_layout()
     return fig, counts
@@ -511,10 +516,10 @@ def plot_failure_gallery(net, dataset, indices, per_class=2, size=224, iou_thres
 
 def plot_dataset_grid(dataset, indices, size=224, ncol=5):
     """
-    Lưới ảnh + prompt + part_mask + grasp GT -- kiểm tra *dữ liệu* trước khi train.
+    A grid of image + prompt + part_mask + GT grasp -- inspect the *data* before training.
 
-    Sai lệch dễ thấy nhất bằng mắt ở đây: mask lệch khỏi vật, mask phủ cả object thay vì một
-    part, hoặc grasp GT không nằm trong mask.
+    The problems easiest to spot by eye live here: a mask offset from the object, a mask
+    covering the whole object instead of one part, or a GT grasp lying outside the mask.
     """
     nrow = int(np.ceil(len(indices) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(2.9 * ncol, 3.2 * nrow), squeeze=False)

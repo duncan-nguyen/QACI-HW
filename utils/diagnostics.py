@@ -1,23 +1,23 @@
-"""Số đo để trả lời ba câu hỏi debug của nhánh text-visual alignment.
+"""Metrics answering the three debugging questions of the text-visual alignment branch.
 
-    1. Token nào đang được chọn?          -> token_stats()
-    2. Vùng được chọn có đúng không?      -> align_stats()
-    3. Grasp có đổi theo prompt không?    -> counterfactual (script/audit_text_reliance.py)
+    1. Which tokens are being selected?   -> token_stats()
+    2. Is the selected region correct?    -> align_stats()
+    3. Does the grasp follow the prompt?  -> counterfactual (script/audit_text_reliance.py)
 
-Cộng thêm hai nhóm chẩn đoán khi nghi ngờ nhánh ngôn ngữ "có mà như không":
+Plus two more groups for when the language branch looks present but inert:
 
-    fusion_stats()  -- r_F = ||F' - F|| / ||F||, fusion có thật sự tác động lên feature không
-    grad_norms()    -- gradient của L_grasp và L_align lên từng khối, để chỉnh lambda
+    fusion_stats()  -- r_F = ||F' - F|| / ||F||, does fusion actually affect the features
+    grad_norms()    -- per-block gradients of L_grasp and L_align, for tuning lambda
 
-Mọi hàm ở đây trả `float`/`dict[str, float]` thuần, không giữ tensor, để gọi trong vòng train
-mà không giữ đồ thị hay chiếm bộ nhớ.
+Every function here returns plain `float`/`dict[str, float]` and holds no tensors, so it can be
+called inside the training loop without retaining the graph or leaking memory.
 """
 import collections
 
 import torch
 import torch.nn.functional as F
 
-# Nhóm tham số cho gradient/<group>. Khớp theo tiền tố tên trong state_dict.
+# Parameter groups for gradient/<group>. Matched by name prefix in the state_dict.
 PARAM_GROUPS = {
     'visual_encoder': ('conv1.', 'bn1.', 'conv2.', 'bn2.', 'conv3.', 'bn3.',
                        'res1.', 'res2.', 'res3.', 'res4.', 'res5.'),
@@ -30,7 +30,7 @@ PARAM_GROUPS = {
 
 
 def match_resolution(target, like):
-    """Hạ target về đúng lưới của `like` (giống hệt thứ compute_loss dùng làm nhãn)."""
+    """Downsample the target onto `like`'s grid (exactly what compute_loss uses as label)."""
     if target.shape[-2:] == like.shape[-2:]:
         return target
     return F.adaptive_avg_pool2d(target, like.shape[-2:]).clamp(0.0, 1.0)
@@ -39,16 +39,16 @@ def match_resolution(target, like):
 @torch.no_grad()
 def align_stats(align_logits, part_mask, threshold=0.5):
     """
-    Chất lượng `A_T` so với `part_mask`, đo ở đúng resolution mà loss dùng.
+    Quality of `A_T` against `part_mask`, measured at the resolution the loss uses.
 
-    :param align_logits: (B, 1, H, W) logits của A_T
-    :param part_mask: (B, 1, H', W') nhãn nhị phân
+    :param align_logits: (B, 1, H, W) logits of A_T
+    :param part_mask: (B, 1, H', W') binary label
     :return: dict -- iou, dice, foreground_score, background_score, score_margin,
              predicted_area, target_area
 
-    `score_margin` = mean(A_T | trong mask) - mean(A_T | ngoài mask). Gần 0 nghĩa là attention
-    chưa phân biệt được foreground/background, kể cả khi BCE đã nhỏ (nhãn lệch ~2-5% nên
-    "đoán toàn 0" đã cho BCE thấp).
+    `score_margin` = mean(A_T | inside mask) - mean(A_T | outside mask). Near 0 means attention
+    does not yet separate foreground from background, even when BCE is already low (the label
+    covers only ~2-5% of pixels, so predicting all-zero already gives a low BCE).
     """
     prob = torch.sigmoid(align_logits)
     target = match_resolution(part_mask, align_logits) > 0.5
@@ -81,14 +81,15 @@ def align_stats(align_logits, part_mask, threshold=0.5):
 @torch.no_grad()
 def token_stats(attn, text_mask):
     """
-    Phân bố alpha theo token: attention đang tập trung hay đang trải đều?
+    Distribution of alpha over tokens: is attention concentrated or spread out?
 
-    :param attn: (B, L, H, W) alpha_pj (đã softmax theo token)
-    :param text_mask: (B, L) bool, True ở token nội dung
+    :param attn: (B, L, H, W) alpha_pj (already softmaxed over tokens)
+    :param text_mask: (B, L) bool, True on content tokens
     :return: dict -- attention_entropy, top1_mass, top3_mass, valid_count, max_entropy
 
-    Cách đọc: entropy ≈ 0 là collapse vào một token; entropy ≈ log(L) là không token nào
-    quan trọng; top1_mass ≈ 1 ngay từ đầu nghĩa là soft attention đang chạy y hệt hard max.
+    How to read it: entropy ~= 0 means collapse onto a single token; entropy ~= log(L) means no
+    token matters; top1_mass ~= 1 from the start means soft attention is behaving exactly like
+    a hard argmax.
     """
     valid = text_mask.float().sum(1)                                   # (B,)
     p = attn.clamp(min=1e-12)
@@ -103,7 +104,7 @@ def token_stats(attn, text_mask):
         'top1_mass': float(top1.mean()),
         'top3_mass': float(top3.mean()),
         'valid_count': float(valid.mean()),
-        # log(L_valid): mốc trên của entropy, để biết entropy quan sát được là cao hay thấp.
+        # log(L_valid): the upper bound on entropy, telling whether the observed value is high or low.
         'max_entropy': float(valid.clamp(min=1).log().mean()),
     }
 
@@ -111,9 +112,9 @@ def token_stats(attn, text_mask):
 @torch.no_grad()
 def winning_tokens(attn, text_mask):
     """
-    Token nào thắng ở nhiều pixel nhất, tính theo từng sample.
+    Which token wins the most pixels, per sample.
 
-    :return: (B, L) tỉ lệ pixel mà token j là argmax_j alpha_pj
+    :return: (B, L) the fraction of pixels where token j is argmax_j alpha_pj
     """
     winner = attn.argmax(dim=1)                                        # (B, H, W)
     b, l = text_mask.shape
@@ -126,11 +127,11 @@ def winning_tokens(attn, text_mask):
 @torch.no_grad()
 def fusion_stats(feat_in, feat_out):
     """
-    r_F = ||F' - F|| / ||F||: fusion có thật sự đổi feature không.
+    r_F = ||F' - F|| / ||F||: does fusion actually change the features.
 
-    r_F ≈ 0 nghĩa là nhánh ngôn ngữ gần như không tác động (với residual fusion khởi tạo 0 thì
-    đúng bằng 0 ở bước đầu -- phải thấy nó *lớn dần*). r_F >> 1 nghĩa là fusion lấn át hẳn
-    feature thị giác.
+    r_F ~= 0 means the language branch has almost no effect (with zero-initialised residual
+    fusion it is exactly 0 at the first step -- what matters is seeing it *grow*). r_F >> 1
+    means fusion is overwhelming the visual features.
     """
     fn = feat_in.flatten(1).norm(dim=1)
     rn = (feat_out - feat_in).flatten(1).norm(dim=1)
@@ -144,7 +145,7 @@ def fusion_stats(feat_in, feat_out):
 def _group_of(name):
     for group, prefixes in PARAM_GROUPS.items():
         if group == 'alignment':
-            continue                # 'alignment' là nhóm bao, xét sau cùng
+            continue                # 'alignment' is the catch-all group, checked last
         if name.startswith(prefixes):
             return group
     if name.startswith(PARAM_GROUPS['alignment']):
@@ -154,7 +155,7 @@ def _group_of(name):
 
 def grad_norms(net):
     """
-    Chuẩn L2 của gradient đang có trên từng khối (gọi *sau* loss.backward()).
+    L2 norm of the current gradient per block (call *after* loss.backward()).
 
     :return: dict group -> norm
     """
@@ -171,12 +172,13 @@ def grad_norms(net):
 
 def grad_norm_split(net, xc, yc, prompts, part_mask, group='visual_encoder'):
     """
-    Gradient của L_grasp và L_align *riêng rẽ* lên một khối, trên cùng một batch.
+    Gradients of L_grasp and L_align *separately* on one block, over the same batch.
 
-    Đây là con số quyết định `--w-align`: nếu ‖∇L_align‖ lớn hơn ‖∇L_grasp‖ hàng chục lần thì
-    nhánh ngôn ngữ đang kéo hỏng nhánh grasp, phải giảm lambda (hoặc kéo dài warmup).
+    This is the number that decides `--w-align`: if ||grad L_align|| is tens of times larger
+    than ||grad L_grasp||, the language branch is wrecking the grasp branch and lambda must come
+    down (or the warmup be lengthened).
 
-    Dùng `torch.autograd.grad` nên **không** đụng vào `.grad` của optimizer.
+    Uses `torch.autograd.grad`, so it does **not** touch the optimizer's `.grad`.
 
     :return: dict -- grasp, align, ratio (align/grasp)
     """
@@ -186,7 +188,7 @@ def grad_norm_split(net, xc, yc, prompts, part_mask, group='visual_encoder'):
         return {}
 
     was_training = net.training
-    net.eval()                      # tắt dropout để hai lần đo dùng chung một đồ thị xác định
+    net.eval()                      # dropout off, so both measurements share a deterministic graph
     try:
         out = net.compute_loss(xc, yc, prompts=prompts, part_mask=part_mask)
         grasp = sum(out['losses'][k] for k in ('p_loss', 'cos_loss', 'sin_loss', 'width_loss'))
@@ -213,11 +215,11 @@ def _norm(grads):
 
 class TokenTally:
     """
-    Gom "token nào thắng ở bao nhiêu phần trăm pixel" trên cả tập validation.
+    Aggregates "which token wins what percentage of pixels" over the whole validation set.
 
-    Bảng này đọc rất nhanh ra bệnh: nếu top toàn là danh từ object (`apple`, `mug`) thì model
-    đang định vị *object* chứ không phải *part* -- đúng thứ hình alignment của run V1 cho thấy.
-    Dấu câu phải bằng 0 tuyệt đối; khác 0 nghĩa là mask token bị hỏng.
+    The table diagnoses quickly: if the top entries are all object nouns (`apple`, `mug`), the
+    model is localising the *object* rather than the *part*. Punctuation must be exactly 0;
+    anything else means the token mask is broken.
     """
 
     def __init__(self):
@@ -226,9 +228,10 @@ class TokenTally:
 
     def update(self, winning, text_mask, token_strings):
         """
-        :param winning: (B, L) tỉ lệ pixel thắng, từ winning_tokens()
+        :param winning: (B, L) fraction of pixels won, from winning_tokens()
         :param text_mask: (B, L) bool
-        :param token_strings: list[list[str]] cùng chiều, từ CLIPTextEncoder.token_strings()
+        :param token_strings: list[list[str]] of matching shape, from
+                              CLIPTextEncoder.token_strings()
         """
         for b in range(winning.shape[0]):
             for j in text_mask[b].nonzero(as_tuple=True)[0].tolist():
@@ -237,13 +240,13 @@ class TokenTally:
             self.total += 1.0
 
     def top(self, k=20):
-        """[(token, tỉ lệ pixel trung bình)] giảm dần."""
+        """[(token, mean pixel fraction)] in descending order."""
         if not self.total:
             return []
         return [(t, m / self.total) for t, m in self.mass.most_common(k)]
 
     def punctuation_mass(self):
-        """Phải bằng 0: token dấu câu đã bị loại khỏi candidate ở CLIPTextEncoder."""
+        """Must be 0: punctuation tokens are excluded from the candidates in CLIPTextEncoder."""
         if not self.total:
             return 0.0
         return sum(m for t, m in self.mass.items()
@@ -251,4 +254,4 @@ class TokenTally:
 
     def as_text(self, k=20):
         lines = [f"{t}: {p:.1%}" for t, p in self.top(k)]
-        return "\n".join(lines) if lines else "(chưa có dữ liệu)"
+        return "\n".join(lines) if lines else "(no data yet)"

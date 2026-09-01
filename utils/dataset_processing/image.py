@@ -9,11 +9,12 @@ from skimage.transform import resize, rotate
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# OpenCV tự mở thread pool riêng cho từng phép. Trong DataLoader mỗi worker đã là một tiến
-# trình, nên để cv2 đẻ thêm thread chỉ khiến N worker giành nhau cùng số core và chậm hơn.
+# OpenCV spawns its own thread pool per operation. Inside a DataLoader each worker is already a
+# process, so letting cv2 add threads only makes N workers fight over the same cores and run
+# slower.
 cv2.setNumThreads(0)
 
-# resize/warpAffine của OpenCV chỉ nhận các depth này; dtype khác (vd int32) rơi về skimage.
+# OpenCV resize/warpAffine only accepts these depths; other dtypes (e.g. int32) fall back to skimage.
 _CV_DTYPES = (np.uint8, np.uint16, np.int16, np.float32, np.float64)
 
 
@@ -21,11 +22,11 @@ def _cv_ok(img):
     return img.dtype.type in _CV_DTYPES and (img.ndim == 2 or img.shape[2] <= 4)
 
 
-
-# `skimage.transform.resize(mode=...)` đặt border cho *bộ lọc anti-alias*, và tên của skimage
-# không trùng tên của cv2: skimage 'reflect' -> scipy 'mirror' -> cv2 BORDER_REFLECT_101, còn
-# skimage 'symmetric' -> scipy 'reflect' -> cv2 BORDER_REFLECT. Ánh xạ sai ở đây thì ảnh lệch
-# ở vài pixel viền -- với đúng ánh xạ này kết quả trùng khít từng bit với bản cũ.
+# `skimage.transform.resize(mode=...)` sets the border for the *anti-alias filter*, and
+# skimage's names do not match cv2's: skimage 'reflect' -> scipy 'mirror' -> cv2
+# BORDER_REFLECT_101, while skimage 'symmetric' -> scipy 'reflect' -> cv2 BORDER_REFLECT. Get
+# this mapping wrong and the image differs on a few border pixels -- with the mapping below the
+# result is bit-identical to the original.
 _SKIMAGE_BORDER = {
     "reflect": cv2.BORDER_REFLECT_101,
     "symmetric": cv2.BORDER_REFLECT,
@@ -35,11 +36,12 @@ _SKIMAGE_BORDER = {
 
 
 def _gauss_kernel(sigma):
-    """Kernel Gauss 1 chiều theo đúng công thức ksize của cv2; sigma <= 0 -> kernel đơn vị."""
+    """1-D gaussian kernel following cv2's ksize formula; sigma <= 0 -> identity kernel."""
     if sigma <= 0:
         return np.ones((1, 1), dtype=np.float64)
     ksize = int(round(sigma * 8 + 1)) | 1
     return cv2.getGaussianKernel(ksize, sigma)
+
 
 class Image:
     """
@@ -56,17 +58,18 @@ class Image:
     @classmethod
     def from_file(cls, fname):
         """
-        Đọc ảnh màu. cv2.imread nhanh hơn imageio ~25% trên JPEG (1,51 ms vs 1,94 ms cho
-        416x416) vì đi thẳng libjpeg-turbo, không qua lớp plugin của imageio.
+        Read a colour image. cv2.imread is ~25% faster than imageio on JPEG (1.51 ms vs 1.94 ms
+        for 416x416) because it goes straight to libjpeg-turbo without imageio's plugin layer.
 
-        cv2 trả BGR nên phải đổi về RGB -- mọi caller của hàm này (cornell, jacquard, vmrd,
-        ocid, grasp-anything) đều coi kênh là RGB.
+        cv2 returns BGR, so it must be converted to RGB -- every caller of this function
+        (cornell, jacquard, vmrd, ocid, grasp-anything) treats the channels as RGB.
         """
         img = cv2.imread(str(fname), cv2.IMREAD_COLOR)
         if img is None:
-            # cv2.imread nuốt lỗi và trả None (file thiếu, quyền, hoặc format lạ); imread của
-            # imageio thì ném exception. Giữ hành vi "nổ ngay" để không train trên ảnh đen.
-            raise FileNotFoundError(f"Không đọc được ảnh: {fname}")
+            # cv2.imread swallows errors and returns None (missing file, permissions, or an
+            # unusual format), whereas imageio's imread raises. Keep the fail-fast behaviour so
+            # training never runs on black images.
+            raise FileNotFoundError(f"Could not read image: {fname}")
         return cls(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
     def copy(self):
@@ -117,20 +120,22 @@ class Image:
         """
         Resize image to shape.
 
-        Thay `skimage.transform.resize` bằng đúng hai bước mà skimage làm bên trong, chỉ khác
-        là chạy bằng cv2: lọc Gauss chống răng cưa với `sigma = (tỉ lệ thu nhỏ - 1) / 2`, rồi
-        nội suy song tuyến. 12,5 ms -> 0,40 ms cho một ảnh 416x416x3 -> 224x224.
+        Replaces `skimage.transform.resize` with exactly the two steps skimage performs
+        internally, only run through cv2: an anti-alias gaussian filter with
+        `sigma = (downscale factor - 1) / 2`, then bilinear interpolation. 12.5 ms -> 0.40 ms
+        for a 416x416x3 -> 224x224 image.
 
-        Sai khác so với bản cũ chỉ là làm tròn: ảnh uint8 lệch 1/255 trên 0,02-0,4% pixel (do
-        tính ở float32 thay vì float64 -- ép về float64 thì trùng khít từng bit nhưng mất
-        3,2 ms), mask float32 lệch 2e-7. Xem `_SKIMAGE_BORDER` và nhánh phóng to bên dưới:
-        hai chỗ đó mới là chỗ dễ lệch *thật*, không phải làm tròn.
+        The only difference from the original is rounding: uint8 images differ by 1/255 on
+        0.02-0.4% of pixels (because the work is done in float32 rather than float64 -- forcing
+        float64 is bit-identical but costs 3.2 ms), float32 masks differ by 2e-7. See
+        `_SKIMAGE_BORDER` and the upscaling branch below: those are where *real* divergence can
+        creep in, not rounding.
 
-        Đừng thay bằng INTER_AREA: nó cũng chống răng cưa nhưng là box filter nên cho ảnh khác
-        skimage tới 0,74/255 mỗi pixel -- mà hoá ra còn *chậm hơn* (0,69 ms).
+        Do not swap in INTER_AREA: it also anti-aliases, but as a box filter, so it differs from
+        skimage by up to 0.74/255 per pixel -- and turns out to be *slower* (0.69 ms).
 
         :param shape: New shape.
-        :param mode: Xử lý biên, cùng tên với skimage ("reflect" hoặc "symmetric").
+        :param mode: Border handling, using skimage's names ("reflect" or "symmetric").
         """
         if self.img.shape == shape:
             return
@@ -142,8 +147,8 @@ class Image:
             return
 
         out_dtype = self.img.dtype
-        # skimage tính toàn bộ ở dấu phẩy động rồi mới ép về dtype cũ. Làm y hệt: nội suy
-        # fixed-point của cv2 trên uint8 sẽ lệch 1 LSB so với đường float.
+        # skimage does all the work in floating point and casts back at the end. Do the same:
+        # cv2's fixed-point interpolation on uint8 would differ by 1 LSB from the float path.
         work = np.float64 if out_dtype == np.float64 else np.float32
         src = np.ascontiguousarray(self.img, dtype=work)
 
@@ -160,22 +165,28 @@ class Image:
 
         border = _SKIMAGE_BORDER.get(mode, cv2.BORDER_REFLECT_101)
         if src.shape[0] >= h and src.shape[1] >= w:
-            # Thu nhỏ: toạ độ nguồn `(i + 0.5) * tỉ_lệ - 0.5` luôn nằm trong ảnh, nên không
-            # có pixel nào lấy mẫu ngoài biên và `cv2.resize` (không cho chọn borderMode)
-            # cho đúng kết quả -- lại nhanh gấp ba warpAffine.
+            # Downscaling: the source coordinate `(i + 0.5) * scale - 0.5` always lies inside
+            # the image, so no pixel samples outside the border and `cv2.resize` (which offers
+            # no borderMode) gives the right result -- and is three times faster than
+            # warpAffine.
             out = cv2.resize(src, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            # Phóng to: hàng/cột ngoài cùng *có* lấy mẫu ngoài biên (dst=0 ứng với src=-0.05),
-            # mà `cv2.resize` luôn nhân bản biên còn skimage thì phản chiếu -> lệch tới 13/255
-            # ở khung viền. warpAffine nhận borderMode nên khớp lại được.
+            # Upscaling: the outermost rows/columns *do* sample outside the border (dst=0 maps
+            # to src=-0.05), and `cv2.resize` always replicates the border while skimage
+            # reflects it -> up to 13/255 of difference along the frame. warpAffine accepts a
+            # borderMode, so it can match.
             sy, sx = src.shape[0] / h, src.shape[1] / w
-            matrix = np.array([[sx, 0.0, 0.5 * sx - 0.5],
-                               [0.0, sy, 0.5 * sy - 0.5]], dtype=np.float64)
-            out = cv2.warpAffine(src, matrix, (w, h),
-                                 flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                                 borderMode=border)
+            matrix = np.array(
+                [[sx, 0.0, 0.5 * sx - 0.5], [0.0, sy, 0.5 * sy - 0.5]], dtype=np.float64
+            )
+            out = cv2.warpAffine(
+                src,
+                matrix,
+                (w, h),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                borderMode=border,
+            )
         self.img = out.astype(out_dtype)
-
 
     def resized(self, *args, **kwargs):
         """
@@ -189,15 +200,16 @@ class Image:
         """
         Rotate the image.
 
-        Ba đường, nhanh dần:
+        Three paths, increasingly fast:
 
-        * góc là bội số của 90 độ quanh tâm ảnh -> `np.rot90`, tức hoán vị chỉ số thuần tuý:
-          0,22 ms thay vì 2,32 ms, và *chính xác tuyệt đối* (skimage vẫn nội suy nên làm tròn
-          sai lệch ~0,3/255 mỗi pixel). Đây đúng là mọi góc mà `GraspDatasetBase.__getitem__`
-          sinh ra, nên đường này gánh gần như toàn bộ lượt gọi lúc train.
-        * góc bất kỳ -> `cv2.warpAffine` với BORDER_REFLECT (tương đương `mode='symmetric'`
-          của skimage; đã đối chiếu: lệch tối đa 1/255).
-        * dtype cv2 không nhận -> skimage như cũ.
+        * an angle that is a multiple of 90 degrees about the image centre -> `np.rot90`, i.e.
+          pure index permutation: 0.22 ms instead of 2.32 ms, and *exact* (skimage still
+          interpolates, so it rounds off by ~0.3/255 per pixel). These are exactly the angles
+          `GraspDatasetBase.__getitem__` generates, so this path carries almost every call
+          during training.
+        * an arbitrary angle -> `cv2.warpAffine` with BORDER_REFLECT (equivalent to skimage's
+          `mode='symmetric'`; verified: at most 1/255 of difference).
+        * a dtype cv2 does not accept -> skimage, as before.
 
         :param angle: Angle (in radians) to rotate by.
         :param center: Center pixel to rotate if specified, otherwise image center is used.
@@ -205,9 +217,9 @@ class Image:
         h, w = self.img.shape[0], self.img.shape[1]
         k = angle / (np.pi / 2)
         k_int = int(round(k))
-        # rot90 quanh tâm ((h-1)/2, (w-1)/2) -- đúng tâm mà skimage dùng khi center=None.
-        # k lẻ đổi chiều cao/rộng nên chỉ dùng được cho ảnh vuông; k=2 (lật cả hai trục) thì
-        # đúng với mọi kích thước.
+        # rot90 is about the centre ((h-1)/2, (w-1)/2) -- exactly the centre skimage uses when
+        # center=None. Odd k swaps height and width, so it only applies to square images; k=2
+        # (flip both axes) is correct at any size.
         if center is None and abs(k - k_int) < 1e-9 and (h == w or k_int % 2 == 0):
             k_int %= 4
             if k_int:
@@ -225,7 +237,7 @@ class Image:
                 preserve_range=True,
             ).astype(self.img.dtype)
             return
-        # skimage lấy tâm ((cols-1)/2, (rows-1)/2) khi center=None; cv2 cũng nhận (x, y).
+        # skimage takes the centre ((cols-1)/2, (rows-1)/2) when center=None; cv2 also takes (x, y).
         c = (
             ((w - 1) / 2.0, (h - 1) / 2.0)
             if center is None

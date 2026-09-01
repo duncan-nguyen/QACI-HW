@@ -44,10 +44,10 @@ class GraspGenerator:
 
     def load_model(self):
         print('Loading model... ')
-        # Chọn device trước khi load, để map_location có giá trị thật.
+        # Pick the device before loading, so map_location has a real value.
         self.device = get_device(force_cpu=False)
-        # load_network đọc cả hai định dạng checkpoint của repo (state_dict mới và module
-        # pickle cũ) -- xem utils/checkpoint.py.
+        # load_network reads both checkpoint formats of this repo (the new state_dict one and
+        # the old pickled module) -- see utils/checkpoint.py.
         self.model = load_network(self.saved_model_path, map_location=self.device)
 
     def generate(self):

@@ -9,12 +9,12 @@ def post_process_output(q_img, cos_img, sin_img, width_img, width_scale=None):
     :param cos_img: cos output of network
     :param sin_img: sin output of network
     :param width_img: Width output of network
-    :param width_scale: Hằng số giải chuẩn hoá width. None = suy ra từ kích thước ảnh.
+    :param width_scale: Width de-normalisation constant. None = infer it from the image size.
     :return: Filtered Q output, Filtered Angle output, Filtered Width output
     """
-    # Nhãn width được chuẩn hoá bằng `output_size / 2` (utils/data/grasp_data.py), nên decode
-    # phải dùng đúng hằng số đó. Hằng 150 cũ chính là `output_size / 2` của GR-ConvNet gốc
-    # (300x300); giữ nguyên nó với input 224 làm mọi grasp dài hơn thật 150/112 = 1.34 lần.
+    # Width labels are normalised by `output_size / 2` (utils/data/grasp_data.py), so decoding
+    # must use that same constant. The old constant 150 is `output_size / 2` of the original
+    # 300x300 GR-ConvNet; keeping it at input 224 makes every grasp 150/112 = 1.34x too long.
     if width_scale is None:
         width_scale = width_img.shape[-1] / 2.0
 

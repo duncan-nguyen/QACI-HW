@@ -1,38 +1,41 @@
-"""Model có *thật sự* đọc prompt không? Đo bằng cách ghép ảnh với prompt sai.
+"""Does the model *actually* read the prompt? Measured by pairing images with wrong prompts.
 
-Một model language-driven có thể đạt điểm cao mà hoàn toàn bỏ qua ngôn ngữ: GA++ có ~4,4
-part cho mỗi scene, các vùng grasp của chúng chồng nhau, nên "grasp trung bình của ảnh" đã ăn
-được kha khá theo metric IoU ≥ 0.25. Bảng Seen/Unseen/H một mình không phân biệt được hai
-trường hợp đó.
+A language-driven model can score well while ignoring language entirely: GA++ has ~4.4 parts
+per scene with overlapping grasp regions, so "the image's average grasp" already scores
+reasonably under the IoU >= 0.25 metric. The Seen/Unseen/H table alone cannot tell those two
+cases apart.
 
-Phép đối chứng giữ nguyên ảnh và ground truth, chỉ thay prompt. Bốn điều kiện, cùng model,
-cùng sample:
+The counterfactual keeps the image and the ground truth and only substitutes the prompt. Four
+conditions, same model, same samples:
 
-    normal      prompt thật                                  -- kết quả chuẩn
-    shuffled    prompt của một object khác                    -- có phụ thuộc ngôn ngữ không
-    fixed       một câu duy nhất cho mọi ảnh                  -- có bỏ qua text hoàn toàn không
-    other_part  prompt của part khác *cùng object*            -- có phân biệt được part không
+    normal      the real prompt                          -- the reference result
+    shuffled    another object's prompt                  -- is there any language dependence
+    fixed       one sentence for every image             -- is text ignored entirely
+    other_part  another part's prompt, *same object*     -- are parts distinguished at all
 
-Con số phải đọc là Δ_prompt = S_normal - S_shuffled:
+The number to read is Delta_prompt = S_normal - S_shuffled:
 
-* lớn   -> nhánh ngôn ngữ đang điều khiển grasp thật.
-* ≈ 0   -> model đoán theo ảnh, phần ngôn ngữ chỉ là trang trí, bất kể align_loss thấp đến đâu.
+* large -> the language branch is genuinely steering the grasp.
+* ~ 0   -> the model predicts from the image alone and the language is decorative, however low
+           align_loss got.
 
-`other_part` khó hơn `shuffled`: hai prompt cùng nói về một vật, chỉ khác part. Nếu Δ ở
-`shuffled` lớn mà ở `other_part` ≈ 0 thì model mới chỉ học "nhận ra vật", chưa học part.
+`other_part` is harder than `shuffled`: both prompts name the same object and differ only in
+the part. A large Delta on `shuffled` with `other_part` ~ 0 means the model has learned to
+recognise the object, not the part.
 
-Kèm theo hai số đo grounding trên `A_T` (ở đúng resolution feature map, như lúc train):
+Two grounding metrics on `A_T` come along with it (at the feature-map resolution, as in
+training):
 
-* `IoU(A_T > 0.5, part_mask)` -- có khoanh đúng vùng part không
-* `pointing` -- pixel `A_T` mạnh nhất có rơi vào part_mask không (không phụ thuộc ngưỡng)
+* `IoU(A_T > 0.5, part_mask)` -- is the right part region outlined
+* `pointing` -- does the strongest `A_T` pixel land inside part_mask (threshold-free)
 
     python script/audit_text_reliance.py --checkpoint logs/.../epoch_67_iou_0.3313 \\
         --dataset-path data/grasp-anything-pp-200k --split-path split/grasp-anything-pp \\
         --n-samples 500
 
-Bổ trợ: `script/diagnose_part_masks.py` kiểm tra chính `part_mask` có ở mức part hay chỉ là
-mask của cả object -- nếu nhãn đã ở mức object thì `L_align` không thể dạy grounding part-level
-và bảng dưới đây cũng chỉ có thể ra Δ nhỏ.
+Companion: `script/diagnose_part_masks.py` checks whether `part_mask` itself is at part level
+or is just the whole object's mask -- if the labels are already at object level, `L_align`
+cannot teach part-level grounding and the table below can only show small deltas.
 """
 import argparse
 import json
@@ -58,17 +61,17 @@ def parse_args():
     p.add_argument("--split-path", default=None)
     p.add_argument("--input-size", type=int, default=224)
     p.add_argument("--n-samples", type=int, default=500,
-                   help="Số sample mỗi split (lấy cách đều). 0 = toàn bộ.")
+                   help="Samples per split (evenly spaced). 0 = all of them.")
     p.add_argument("--iou-threshold", type=float, default=0.25)
     p.add_argument("--n-grasps", type=int, default=1)
-    p.add_argument("--seed", type=int, default=0, help="Seed của phép hoán vị prompt")
+    p.add_argument("--seed", type=int, default=0, help="Seed for the prompt permutation")
     p.add_argument("--splits", nargs="+", default=["seen", "unseen"],
                    choices=["seen", "unseen"])
     p.add_argument("--fixed-prompt", default="Grasp the object.",
-                   help="Câu dùng chung cho mọi ảnh ở điều kiện 'fixed'")
-    p.add_argument("--out", default=None, help="Ghi kết quả JSON vào file này")
+                   help="The sentence shared by every image in the 'fixed' condition")
+    p.add_argument("--out", default=None, help="Write the results as JSON to this file")
     p.add_argument("--figures", default=None,
-                   help="Thư mục ghi gallery lỗi (bốn nhóm) cho mỗi split")
+                   help="Directory for the four-class failure gallery of each split")
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
@@ -82,21 +85,21 @@ def load_dataset(args, seen):
 
 
 def grasp_metrics(net, x, prompt, gtbb, iou_threshold, n_grasps):
-    """Chạy một forward với đúng một prompt, trả (max IoU, đạt/trượt, Q, A_T)."""
+    """One forward pass with a single prompt -> (max IoU, pass/fail, Q, A_T)."""
     with torch.no_grad():
         pred = net.predict(x, [prompt]) if getattr(net, "use_text", False) else net.predict(x)
     q_img, ang_img, width_img = post_process_output(
         pred["pos"], pred["cos"], pred["sin"], pred["width"])
     grasps = detect_grasps(q_img, ang_img, width_img=width_img, no_grasps=n_grasps)
-    # `Grasp.max_iou` trả 0 khi lệch góc > 30 độ, nên so với ngưỡng IoU là gói trọn cả hai
-    # điều kiện của metric trong paper.
+    # `Grasp.max_iou` returns 0 when the angular error exceeds 30 degrees, so comparing against
+    # the IoU threshold captures both conditions of the paper's metric.
     best = max((g.max_iou(gtbb) for g in grasps), default=0.0)
     return float(best), bool(best > iou_threshold), pred
 
 
 def align_metrics(pred, part_mask):
     """
-    IoU và pointing-game của `A_T` so với `part_mask`, đo ở resolution của A_T (như lúc train).
+    IoU and pointing game of `A_T` against `part_mask`, at A_T's resolution (as in training).
     """
     if "align" not in pred:
         return None, None
@@ -116,7 +119,7 @@ CONDITIONS = ("normal", "shuffled", "fixed", "other_part")
 
 
 def other_part_prompt(ds, idx):
-    """Prompt của một part *khác* cùng object, hoặc None nếu object chỉ có một part."""
+    """The prompt of a *different* part of the same object, or None if it has only one."""
     object_id = ds._object_id(ds.sample_id(idx))
     for path in ds._files_by_object.get(object_id, []):
         other = ds.grasp_files.index(path)
@@ -126,7 +129,7 @@ def other_part_prompt(ds, idx):
 
 
 def audit_split(net, ds, args, device):
-    ds.shuffle_prompts(seed=args.seed)          # perm dùng chung cho cả split
+    ds.shuffle_prompts(seed=args.seed)          # one permutation shared by the whole split
     n = len(ds.grasp_files)
     step = max(1, n // args.n_samples) if args.n_samples else 1
     indices = list(range(0, n, step))[: args.n_samples or n]
@@ -193,7 +196,7 @@ def audit_split(net, ds, args, device):
 
 
 def save_failure_gallery(net, ds, args, folder, name):
-    """Gallery lỗi bốn nhóm -- lỗi ở grounding hay ở grasp decoder."""
+    """The four-class failure gallery -- grounding fault or grasp-decoder fault."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -211,13 +214,13 @@ def save_failure_gallery(net, ds, args, folder, name):
     if fig is not None:
         fig.savefig(path, dpi=110, bbox_inches="tight")
         plt.close(fig)
-        print(f"  gallery lỗi: {path}")
+        print(f"  failure gallery: {path}")
     return counts
 
 
 def print_table(results):
     print()
-    header = f"{'split':8} {'điều kiện':11} {'n':>6} {'success':>9} {'IoU':>8} " \
+    header = f"{'split':8} {'condition':11} {'n':>6} {'success':>9} {'IoU':>8} " \
              f"{'A_T IoU':>9} {'pointing':>9}"
     print(header)
     print("-" * len(header))
@@ -235,10 +238,11 @@ def print_table(results):
         print(f"{split:8} {drops}   mean|ΔQ|={r['dq']:.2e}")
         print()
 
-    print("Δ_shuffled ≈ 0: grasp không phụ thuộc prompt -- không kết luận được nhánh ngôn ngữ")
-    print("có ích, dù align_loss thấp. Δ_shuffled lớn nhưng Δ_other_part ≈ 0: model nhận ra")
-    print("*vật* chứ chưa phân biệt *part*. Trước khi quy lỗi cho model, chạy")
-    print("script/check_dataset.py xem part_mask có thật sự ở mức part không.")
+    print("Delta_shuffled ~ 0: the grasp does not depend on the prompt -- nothing can be")
+    print("concluded about the language branch being useful, however low align_loss is. A large")
+    print("Delta_shuffled with Delta_other_part ~ 0: the model recognises the *object* but not")
+    print("the *part*. Before blaming the model, run script/check_dataset.py to see whether")
+    print("part_mask really is at part level.")
 
 
 def main():

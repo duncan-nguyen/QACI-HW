@@ -1,25 +1,26 @@
 #!/bin/bash
 #
-# Đánh giá một checkpoint trên Grasp-Anything++ theo protocol của paper LGD (§5.1):
-# chạy cả tập seen (Base) lẫn unseen (New), rồi in harmonic mean H như Table 2.
+# Evaluate one checkpoint on Grasp-Anything++ following the LGD paper's protocol (Sec. 5.1):
+# run both the seen (Base) and unseen (New) sets, then print the harmonic mean H as in Table 2.
 #
-# Metric do evaluate.py tính: IoU >= 0.25 và lệch góc <= 30 độ (utils/dataset_processing).
+# The metric computed by evaluate.py: IoU >= 0.25 and angular error <= 30 degrees
+# (utils/dataset_processing).
 #
 # Usage:
 #   script/eval_grasp_anything_pp.sh <checkpoint> [dataset_dir] [split_frac]
 #
-#   split_frac: phần dữ liệu BỎ QUA ở đầu (evaluate.py đánh giá phần còn lại).
-#               0.99 = chỉ lấy 1% cuối cho nhanh; 0.0 = toàn bộ tập.
+#   split_frac: the leading fraction of the data to SKIP (evaluate.py scores the rest).
+#               0.99 = only the last 1%, for speed; 0.0 = the whole set.
 
 set -euo pipefail
 
-NETWORK="${1:?cần đường dẫn checkpoint}"
+NETWORK="${1:?a checkpoint path is required}"
 DATA="${2:-data/grasp-anything-pp}"
 SPLIT="${3:-0.99}"
 PYTHON="${PYTHON:-python}"
 
 if [ ! -f "$NETWORK" ]; then
-    echo "Không thấy checkpoint: $NETWORK" >&2
+    echo "Checkpoint not found: $NETWORK" >&2
     exit 1
 fi
 

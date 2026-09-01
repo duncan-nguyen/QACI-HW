@@ -6,9 +6,9 @@ import json
 import logging
 import os
 
-# Tokenizer "fast" của HuggingFace mở thread pool Rust; DataLoader fork worker sau đó thì
-# tokenizers in cảnh báo và có thể treo. Ta tokenize *trong* worker nên không cần song song
-# trong tiến trình chính. Phải đặt trước khi transformers được import.
+# HuggingFace's "fast" tokenizers open a Rust thread pool; when the DataLoader forks workers
+# afterwards, tokenizers prints a warning and can deadlock. We tokenize *inside* the workers,
+# so no parallelism is needed in the main process. Must be set before transformers is imported.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import cv2
@@ -27,7 +27,7 @@ from utils.dataset_processing import evaluation
 from utils.diagnostics import TokenTally, align_stats, grad_norm_split, grad_norms
 from utils.visualisation.gridshow import gridshow
 
-# Epoch mặc định để lưu hình probe: dày lúc đầu (attention học nhanh nhất ở đó), thưa dần.
+# Default epochs for probe figures: dense early (attention learns fastest there), then sparse.
 PROBE_EPOCHS = "0,1,3,10,25"
 
 GRASP_LOSSES = ("p_loss", "cos_loss", "sin_loss", "width_loss")
@@ -80,84 +80,84 @@ def parse_args():
         "--split-path",
         type=str,
         default=None,
-        help="Thư mục chứa seen.obj/unseen.obj (mặc định dò theo SPLIT_DIRS của loader)",
+        help="Directory holding seen.obj/unseen.obj (default: the loader's SPLIT_DIRS)",
     )
 
-    # Nhánh text-visual alignment (chỉ dùng bởi network grconvnet3_align)
+    # Text-visual alignment branch (only used by the stag network)
     parser.add_argument(
         "--use-text",
         type=int,
         default=1,
-        help="Bật nhánh ngôn ngữ (1/0). 0 = baseline no-text",
+        help="Enable the language branch (1/0). 0 = image-only baseline",
     )
     parser.add_argument(
-        "--w-align", type=float, default=1.0, help="Trọng số L_align(A_T, part_mask)"
+        "--w-align", type=float, default=1.0, help="Weight of L_align(A_T, part_mask)"
     )
     parser.add_argument(
         "--align-mode",
         type=str,
         default="soft",
         choices=["soft", "hard"],
-        help="Cách gộp token: 'soft' = softmax theo token (V2), 'hard' = max (V1)",
+        help="How tokens are pooled: 'soft' = softmax over tokens, 'hard' = argmax",
     )
     parser.add_argument(
         "--region-text",
         type=int,
         default=1,
-        help="Đưa R_T (text feature của vùng) vào decoder (1/0)",
+        help="Feed R_T (the region's text feature) to the decoder (1/0)",
     )
     parser.add_argument(
         "--fusion",
         type=str,
         default="residual",
         choices=["residual", "gate"],
-        help="'residual' = F + phi([F, F*A_T, R_T]) (V2); 'gate' = F*(1+lambda*A_T) (V1)",
+        help="'residual' = F + phi([F, F*A_T, R_T]); 'gate' = F*(1+lambda*A_T)",
     )
     parser.add_argument(
         "--align-stage",
         type=str,
         default="bottleneck",
         choices=["bottleneck", "conv4"],
-        help="Nơi tính A_T: sau res5 (56x56) hay sau conv4 (113x113, mịn hơn cho part nhỏ)",
+        help="Where A_T is computed: after res5 (56x56) or after conv4 (113x113, finer for small parts)",
     )
     parser.add_argument(
         "--warmup-epochs",
         type=int,
         default=5,
-        help="Số epoch warmup trọng số L_align",
+        help="Number of epochs over which the L_align weight is warmed up",
     )
 
-    # Chẩn đoán (xem utils/diagnostics.py và README mục "Đọc log")
+    # Diagnostics (see utils/diagnostics.py and the "Reading the logs" section of the README)
     parser.add_argument(
         "--diag-interval",
         type=int,
         default=500,
-        help="Cứ mỗi bấy nhiêu batch thì ghi fusion/token/gradient vào TensorBoard. 0 = tắt.",
+        help="Log fusion/token/gradient stats to TensorBoard every N batches. 0 = off.",
     )
     parser.add_argument(
         "--probe-samples",
         type=int,
         default=8,
-        help="Số sample cố định để vẽ hình alignment qua các epoch. 0 = không vẽ.",
+        help="Number of fixed samples used for alignment figures across epochs. 0 = no figures.",
     )
     parser.add_argument(
         "--probe-epochs",
         type=str,
         default=PROBE_EPOCHS,
-        help="Các epoch vẽ probe set, ngăn bằng dấu phẩy (epoch tốt nhất luôn được vẽ thêm).",
+        help="Comma-separated epochs at which the probe set is drawn (the best epoch is always added).",
     )
     parser.add_argument(
         "--counterfactual-every",
         type=int,
         default=5,
-        help="Cứ mỗi bấy nhiêu epoch thì chạy validation với prompt hoán vị và prompt cố định "
-        "để đo Δ_prompt. 0 = tắt. Mỗi lần tốn thêm hai lượt validate.",
+        help="Every N epochs, run validation with shuffled and fixed prompts to measure "
+        "Delta_prompt. 0 = off. Each run costs two extra validation passes.",
     )
     parser.add_argument(
         "--fixed-prompt",
         type=str,
         default="Grasp the object.",
-        help="Prompt dùng chung cho mọi ảnh trong nhánh đối chứng 'fixed'",
+        help="The single prompt used for every image in the 'fixed' counterfactual arm",
     )
     parser.add_argument(
         "--split",
@@ -170,9 +170,9 @@ def parse_args():
         "--test-split",
         type=float,
         default=0.0,
-        help="Tỉ lệ dataset giữ lại làm test, cắt ở cuối danh sách và KHÔNG dùng lúc train "
-        "hay chọn checkpoint. Đánh giá bằng `evaluate.py --subset test` với cùng --split/"
-        "--test-split/--ds-shuffle. Mặc định 0.0 = hành vi cũ (không có tập test độc lập).",
+        help="Fraction of the dataset held out as test, taken from the end of the list and NOT "
+        "used for training or checkpoint selection. Evaluate it with `evaluate.py --subset "
+        "test` using the same --split/--test-split/--ds-shuffle. Default 0.0 = no held-out test.",
     )
     parser.add_argument(
         "--ds-shuffle", action="store_true", default=False, help="Shuffle the dataset"
@@ -188,15 +188,15 @@ def parse_args():
         "--prefetch-factor",
         type=int,
         default=2,
-        help="Số batch mỗi DataLoader worker chuẩn bị trước. Giá trị lớn nhân rất nhanh "
-        "với batch-size và num-workers, có thể làm hệ điều hành SIGKILL vì hết RAM.",
+        help="Batches each DataLoader worker prepares ahead. Large values multiply quickly with "
+        "batch-size and num-workers and can get the process SIGKILLed for running out of RAM.",
     )
     parser.add_argument(
         "--tokenize-in-loader",
         type=int,
         default=1,
-        help="Tokenize prompt trong DataLoader worker thay vì tiến trình chính (1/0). "
-        "Tokenize 64 prompt tốn 6,3 ms và nằm thẳng trên đường găng của mỗi step.",
+        help="Tokenize prompts inside the DataLoader workers instead of the main process (1/0). "
+        "Tokenizing 64 prompts costs 6.3 ms, straight on the critical path of every step.",
     )
 
     # Training
@@ -205,37 +205,38 @@ def parse_args():
         "--val-batch-size",
         type=int,
         default=32,
-        help="Batch size lúc validate. Bản cũ cố định 1, tức forward 1 ảnh một lần trên GPU. "
-        "Kết quả không đổi (post-process và IoU vẫn tính từng sample một).",
+        help="Validation batch size. Upstream hard-codes 1, i.e. one image per GPU forward. "
+        "Results are unchanged (post-processing and IoU are still computed per sample).",
     )
     parser.add_argument(
         "--amp",
         type=str,
         default="auto",
         choices=["auto", "off", "bf16", "fp16"],
-        help="Mixed precision. 'auto' = bf16 nếu GPU hỗ trợ, ngược lại tắt. 'fp16' kèm "
-        "GradScaler. CHÚ Ý: bật AMP làm số liệu khác bản fp32 thuần -- ghi rõ khi báo cáo.",
+        help="Mixed precision. 'auto' = bf16 if the GPU supports it, otherwise off. 'fp16' adds a "
+        "GradScaler. NOTE: enabling AMP shifts the numbers away from pure fp32 -- say so when "
+        "reporting.",
     )
     parser.add_argument(
         "--channels-last",
         type=str,
         default="auto",
         choices=["auto", "0", "1"],
-        help="Bố cục NHWC cho conv. 'auto' = bật khi AMP đang bật trên CUDA (không có "
-        "tensor core thì NHWC thường chậm hơn).",
+        help="NHWC layout for convolutions. 'auto' = on when AMP is on under CUDA (without tensor "
+        "cores NHWC is usually slower).",
     )
     parser.add_argument(
         "--cudnn-benchmark",
         type=int,
         default=1,
-        help="Cho cuDNN dò thuật toán conv nhanh nhất. Input size cố định nên chỉ tốn vài "
-        "batch đầu rồi lời mãi.",
+        help="Let cuDNN benchmark for the fastest conv algorithm. The input size is fixed, so this "
+        "costs a few batches once and pays off for the rest of the run.",
     )
     parser.add_argument(
         "--tf32",
         type=int,
         default=1,
-        help="Cho phép TF32 trong matmul/cuDNN trên Ampere trở lên.",
+        help="Allow TF32 in matmul/cuDNN on Ampere and newer.",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     parser.add_argument(
@@ -243,15 +244,15 @@ def parse_args():
         type=str,
         default="none",
         choices=["none", "cosine", "step"],
-        help="Lịch giảm learning rate. 'none' giữ nguyên hành vi cũ; 'cosine' giảm mượt về 0; "
-        "'step' chia 10 ở 60%% và 85%% số epoch.",
+        help="Learning-rate schedule. 'none' keeps the upstream behaviour; 'cosine' decays smoothly "
+        "to 0; 'step' divides by 10 at 60%% and 85%% of the epochs.",
     )
     parser.add_argument(
         "--lr",
         type=float,
         default=None,
-        help="Learning rate (mặc định: 1e-3 cho adam, 0.01 cho sgd). Đổi batch size thì nên "
-        "đổi theo, quy tắc thô là scale tuyến tính.",
+        help="Learning rate (default: 1e-3 for adam, 0.01 for sgd). Should be adjusted with the "
+        "batch size; linear scaling is the rough rule.",
     )
     parser.add_argument(
         "--batches-per-epoch", type=int, default=1000, help="Batches per Epoch"
@@ -294,11 +295,11 @@ def parse_args():
 
 def resolve_amp(mode, device):
     """
-    Kiểu dữ liệu cho autocast, hoặc None nếu chạy fp32 thuần.
+    The autocast dtype, or None for pure fp32.
 
-    'auto' chỉ chọn bf16 -- bf16 có cùng dải mũ với fp32 nên không cần loss scaling và không
-    tràn số; fp16 nhanh tương đương nhưng phải kèm GradScaler và có thể mất ổn định, nên chỉ
-    bật khi người dùng gọi tên nó ra.
+    'auto' only ever picks bf16 -- it has the same exponent range as fp32, so it needs no loss
+    scaling and does not overflow. fp16 is about as fast but requires a GradScaler and can be
+    unstable, so it is only used when explicitly asked for.
     """
     if mode == "off" or device.type != "cuda":
         return None
@@ -317,8 +318,8 @@ def autocast_ctx(device, amp_dtype):
 
 def to_device(x, device, channels_last=False):
     """
-    `non_blocking=True` chỉ có tác dụng khi bộ nhớ nguồn đã pinned -- DataLoader đang bật
-    `pin_memory`, nên copy H2D chồng lấn được với phần tính toán của batch trước.
+    `non_blocking=True` only helps when the source memory is pinned -- the DataLoader has
+    `pin_memory` on, so the H2D copy overlaps with the previous batch's compute.
     """
     x = x.to(device, non_blocking=True)
     if channels_last and x.dim() == 4:
@@ -328,14 +329,14 @@ def to_device(x, device, channels_last=False):
 
 class LossMeter:
     """
-    Cộng dồn loss *trên GPU*, chỉ đồng bộ một lần lúc kết thúc epoch.
+    Accumulate losses *on the GPU*, synchronising only once at the end of the epoch.
 
-    Bản cũ gọi `.item()` cho tổng loss và cho từng thành phần ngay trong vòng lặp: 5-7 lần
-    `cudaStreamSynchronize` mỗi batch, mỗi lần chặn CPU cho tới khi toàn bộ hàng đợi kernel
-    chạy xong -- đúng thứ phá vỡ việc chồng lấn giữa nạp dữ liệu và tính toán.
+    Upstream calls `.item()` on the total and on every component inside the loop: 5-7
+    `cudaStreamSynchronize` calls per batch, each blocking the CPU until the whole kernel
+    queue drains -- exactly what breaks the overlap between data loading and compute.
 
-    Cộng dồn ở float64 để giữ nguyên độ chính xác của phép cộng Python cũ (quan trọng khi
-    autocast bật, vì loss lúc đó là bf16/fp16).
+    Accumulation is in float64 to keep the precision of the original Python summation
+    (important under autocast, where the loss is bf16/fp16).
     """
 
     def __init__(self, device):
@@ -348,28 +349,34 @@ class LossMeter:
         self.total += loss.detach().double() * weight
         for name, value in losses.items():
             if name not in self.parts:
-                self.parts[name] = torch.zeros((), dtype=torch.float64, device=self.device)
+                self.parts[name] = torch.zeros(
+                    (), dtype=torch.float64, device=self.device
+                )
             self.parts[name] += value.detach().double() * weight
         self.weight += weight
 
     def result(self):
         denominator = self.weight if self.weight else 1.0
-        return (float(self.total) / denominator,
-                {name: float(value) / denominator for name, value in self.parts.items()})
+        return (
+            float(self.total) / denominator,
+            {name: float(value) / denominator for name, value in self.parts.items()},
+        )
 
 
 def batch_extras(net, batch, device):
     """
-    Lấy prompt / part_mask ở phần tử thứ 6 của batch (chỉ Grasp-Anything++ có).
-    Model không khai báo `accepts_extras` thì trả dict rỗng -> chữ ký compute_loss cũ giữ nguyên.
+    Pull prompt / part_mask from the 6th element of the batch (only Grasp-Anything++ has it).
+    Models that do not declare `accepts_extras` get an empty dict, so the original
+    compute_loss signature still works.
     """
     if len(batch) < 6 or not getattr(net, "accepts_extras", False):
         return {}
     extra = batch[5]
     kwargs = {}
     if "prompt_tokens" in extra:
-        # Loader đã tokenize trong worker -> đưa thẳng tensor cho CLIPTextEncoder (nó tự
-        # chuyển sang device). Key "prompt" vẫn là chuỗi gốc, dành cho phần vẽ hình.
+        # The loader already tokenized in a worker -> hand the tensors straight to
+        # CLIPTextEncoder (it moves them to the device). The "prompt" key keeps the raw
+        # strings, for the figures.
         kwargs["prompts"] = extra["prompt_tokens"]
     elif "prompt" in extra:
         kwargs["prompts"] = extra["prompt"]
@@ -378,41 +385,60 @@ def batch_extras(net, batch, device):
     return kwargs
 
 
-def validate(net, device, val_data, iou_threshold, diagnostics=False,
-             amp_dtype=None, channels_last=False):
+def validate(
+    net,
+    device,
+    val_data,
+    iou_threshold,
+    diagnostics=False,
+    amp_dtype=None,
+    channels_last=False,
+):
     """
     Run validation.
 
-    Batch hoá được (`--val-batch-size`): forward chạy theo lô, còn post-process và IoU vẫn
-    tính *từng sample một* trên đúng lát cắt `[i:i+1]` -- `post_process_output` lọc gaussian
-    2 chiều, đưa cả lô vào thì nó sẽ làm mờ xuyên qua chiều batch. Nhờ giữ lát cắt trên GPU
-    (chứ không gom về CPU rồi cắt) mà con số ra giống hệt bản batch_size=1 khi tắt AMP.
+    Batched (`--val-batch-size`): the forward pass runs on batches, while post-processing and
+    IoU are still computed *per sample* on the `[i:i+1]` slice -- `post_process_output` applies
+    a 2-D gaussian filter, so feeding it a whole batch would blur across the batch dimension.
+    Keeping the slice on the GPU (rather than moving to CPU and slicing there) makes the
+    numbers identical to the batch_size=1 version when AMP is off.
 
-    Mọi đại lượng trung bình đều nhân trọng số theo *số sample* của lô, nên lô cuối lẻ không
-    kéo lệch kết quả.
+    Every average is weighted by the *sample count* of its batch, so a short final batch does
+    not skew the result.
 
     :param net: Network
     :param device: Torch device
     :param val_data: Validation Dataset
     :param iou_threshold: IoU threshold
-    :param diagnostics: gom thêm chất lượng alignment + phân bố token (utils/diagnostics.py).
-                        Chỉ có ý nghĩa với model có nhánh ngôn ngữ.
-    :param amp_dtype: kiểu autocast, None = fp32
-    :param channels_last: đưa input về NHWC
+    :param diagnostics: also collect alignment quality + token distribution
+                        (utils/diagnostics.py). Only meaningful for models with a language
+                        branch.
+    :param amp_dtype: autocast dtype, None = fp32
+    :param channels_last: move inputs to NHWC
     :return: Successes, Failures and Losses
     """
     net.eval()
 
-    results = {"correct": 0, "failed": 0, "loss": 0, "losses": {}, "align": {}, "token": {},
-               "tally": TokenTally()}
+    results = {
+        "correct": 0,
+        "failed": 0,
+        "loss": 0,
+        "losses": {},
+        "align": {},
+        "token": {},
+        "tally": TokenTally(),
+    }
 
     meter = LossMeter(device)
     collect = diagnostics and getattr(net, "use_text", False)
     n_align = 0
 
-    with torch.no_grad(), (net.collecting_stats() if collect else contextlib.nullcontext()):
+    with (
+        torch.no_grad(),
+        net.collecting_stats() if collect else contextlib.nullcontext(),
+    ):
         for batch in val_data:
-            # GA++ trả thêm phần tử thứ 6 (prompt / part_mask); các dataset khác trả đúng 5.
+            # GA++ returns a 6th element (prompt / part_mask); other datasets return exactly 5.
             x, y, didx, rot, zoom_factor = batch[:5]
             batch_size = x.shape[0]
             xc = to_device(x, device, channels_last)
@@ -423,36 +449,48 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False,
 
             meter.update(lossd["loss"], lossd["losses"], weight=batch_size)
 
-            if collect and lossd.get("align_logits") is not None and "part_mask" in extras:
-                # Đo trên *toàn bộ* val, không phải trên probe set: hai thứ này trả lời câu
-                # "vùng chọn có đúng không" nên cần thống kê chứ không cần ví dụ đẹp.
+            if (
+                collect
+                and lossd.get("align_logits") is not None
+                and "part_mask" in extras
+            ):
+                # Measured over the *whole* validation set, not the probe set: these answer
+                # "is the selected region right", which needs statistics, not nice examples.
                 n_align += batch_size
-                for k, v in align_stats(lossd["align_logits"], extras["part_mask"]).items():
+                for k, v in align_stats(
+                    lossd["align_logits"], extras["part_mask"]
+                ).items():
                     results["align"][k] = results["align"].get(k, 0.0) + v * batch_size
                 stats = lossd.get("stats", {})
                 for k, v in stats.items():
                     if k.startswith("token/") or k.startswith("fusion/"):
-                        results["token"][k] = results["token"].get(k, 0.0) + v * batch_size
+                        results["token"][k] = (
+                            results["token"].get(k, 0.0) + v * batch_size
+                        )
                 if "_winning_tokens" in stats and "prompts" in extras:
-                    results["tally"].update(stats["_winning_tokens"], stats["_text_mask"],
-                                            net.text_encoder.token_strings(extras["prompts"]))
+                    results["tally"].update(
+                        stats["_winning_tokens"],
+                        stats["_text_mask"],
+                        net.text_encoder.token_strings(extras["prompts"]),
+                    )
 
             pred = lossd["pred"]
             for i in range(batch_size):
-                # `.float()` là no-op khi tắt AMP; bật bf16 thì bắt buộc vì numpy không có
-                # kiểu bfloat16.
+                # `.float()` is a no-op with AMP off; under bf16 it is required, because
+                # numpy has no bfloat16 dtype.
                 q_out, ang_out, w_out = post_process_output(
-                    pred["pos"][i:i + 1].float(),
-                    pred["cos"][i:i + 1].float(),
-                    pred["sin"][i:i + 1].float(),
-                    pred["width"][i:i + 1].float(),
+                    pred["pos"][i : i + 1].float(),
+                    pred["cos"][i : i + 1].float(),
+                    pred["sin"][i : i + 1].float(),
+                    pred["width"][i : i + 1].float(),
                 )
 
                 s = evaluation.calculate_iou_match(
                     q_out,
                     ang_out,
-                    val_data.dataset.get_gtbb(int(didx[i]), float(rot[i]),
-                                              float(zoom_factor[i])),
+                    val_data.dataset.get_gtbb(
+                        int(didx[i]), float(rot[i]), float(zoom_factor[i])
+                    ),
                     no_grasps=1,
                     grasp_width=w_out,
                     threshold=iou_threshold,
@@ -465,13 +503,29 @@ def validate(net, device, val_data, iou_threshold, diagnostics=False,
 
     results["loss"], results["losses"] = meter.result()
     for group in ("align", "token"):
-        results[group] = {k: v / n_align for k, v in results[group].items()} if n_align else {}
-    results["accuracy"] = results["correct"] / max(1, results["correct"] + results["failed"])
+        results[group] = (
+            {k: v / n_align for k, v in results[group].items()} if n_align else {}
+        )
+    results["accuracy"] = results["correct"] / max(
+        1, results["correct"] + results["failed"]
+    )
     return results
 
 
-def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=False,
-          tb=None, diag_interval=0, amp_dtype=None, scaler=None, channels_last=False):
+def train(
+    epoch,
+    net,
+    device,
+    train_data,
+    optimizer,
+    batches_per_epoch,
+    vis=False,
+    tb=None,
+    diag_interval=0,
+    amp_dtype=None,
+    scaler=None,
+    channels_last=False,
+):
     """
     Run one training epoch
     :param epoch: Current epoch
@@ -481,13 +535,13 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
     :param optimizer: Optimizer
     :param batches_per_epoch:  Data batches to train on
     :param vis:  Visualise training progress
-    :param tb: SummaryWriter để ghi chẩn đoán theo *step* (fusion/token/gradient)
-    :param diag_interval: cứ mỗi bấy nhiêu batch thì đo một lần. 0 = tắt. Đo mỗi bước là phí:
-                          entropy + argmax trên (B, L, H, W) và grad_norm_split tốn thêm hai
-                          lượt backward.
-    :param amp_dtype: kiểu autocast (None = fp32)
-    :param scaler: GradScaler, chỉ bật thật khi amp_dtype là fp16
-    :param channels_last: đưa input về NHWC
+    :param tb: SummaryWriter for per-*step* diagnostics (fusion/token/gradient)
+    :param diag_interval: measure once every N batches. 0 = off. Measuring every step is
+                          wasteful: entropy + argmax over (B, L, H, W), and grad_norm_split
+                          costs two extra backward passes.
+    :param amp_dtype: autocast dtype (None = fp32)
+    :param scaler: GradScaler, only really enabled when amp_dtype is fp16
+    :param channels_last: move inputs to NHWC
     :return:  Average Losses for Epoch
     """
     results = {"loss": 0, "losses": {}}
@@ -497,9 +551,10 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
 
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
-    # Điều kiện dừng nằm ở đầu vòng trong: bản cũ tăng `batch_idx` rồi mới break, nên vòng
-    # ngoài vào lại một lần nữa, nạp thêm một batch (và copy part_mask lên GPU) chỉ để vứt đi
-    # -- kết quả là 1.999 optimizer step cho --batches-per-epoch 2000.
+    # The stop condition sits at the top of the inner loop: upstream increments `batch_idx`
+    # before breaking, so the outer loop re-enters and fetches one more batch (copying
+    # part_mask to the GPU) only to throw it away -- 1,999 optimizer steps for
+    # --batches-per-epoch 2000.
     while batch_idx < batches_per_epoch:
         for batch in train_data:
             if batch_idx >= batches_per_epoch:
@@ -508,8 +563,12 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             extras = batch_extras(net, batch, device)
             batch_idx += 1
             step = epoch * batches_per_epoch + batch_idx
-            diag = (diag_interval and tb is not None and batch_idx % diag_interval == 0
-                    and getattr(net, "use_text", False))
+            diag = (
+                diag_interval
+                and tb is not None
+                and batch_idx % diag_interval == 0
+                and getattr(net, "use_text", False)
+            )
 
             xc = to_device(x, device, channels_last)
             yc = [to_device(yy, device) for yy in y]
@@ -520,8 +579,8 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             loss = lossd["loss"]
 
             if batch_idx % 100 == 0:
-                # `.item()` ở đây đồng bộ GPU, nên chỉ gọi mỗi 100 batch. Phần cộng dồn loss
-                # thì để LossMeter giữ trên GPU tới cuối epoch.
+                # `.item()` synchronises the GPU, so it is only called every 100 batches. The
+                # loss accumulation itself stays on the GPU in LossMeter until the epoch ends.
                 logging.info(
                     f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item():0.4f}"
                 )
@@ -532,8 +591,9 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             if scaler is not None and scaler.is_enabled():
                 scaler.scale(loss).backward()
                 if diag:
-                    # grad_norms đọc thẳng `.grad`, mà lúc này gradient còn nhân hệ số scale
-                    # của fp16 -> phải gỡ scale trước khi đo, nếu không con số vô nghĩa.
+                    # grad_norms reads `.grad` directly, and at this point the gradients are
+                    # still multiplied by the fp16 scale factor -> unscale before measuring,
+                    # otherwise the numbers are meaningless.
                     scaler.unscale_(optimizer)
                     log_step_diagnostics(tb, net, lossd, step, xc, yc, extras)
                 scaler.step(optimizer)
@@ -582,11 +642,11 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
 
 def log_step_diagnostics(tb, net, lossd, step, xc, yc, extras):
     """
-    Chẩn đoán theo step: fusion có tác động không, token có collapse không, gradient của
-    L_align so với L_grasp lớn cỡ nào. Gọi *giữa* backward() và optimizer.step().
+    Per-step diagnostics: is fusion having an effect, are tokens collapsing, how large is the
+    L_align gradient relative to L_grasp. Call *between* backward() and optimizer.step().
     """
-    # Tiền tố "step/": cùng tên với chỉ số đo trên validation nhưng trục x là *step* chứ không
-    # phải epoch -- để chung một tag thì hai đường chồng lên nhau ở hai thang đo khác nhau.
+    # The "step/" prefix: same metric names as on validation, but the x axis is the *step*, not
+    # the epoch -- sharing a tag would overlay two curves on two different scales.
     for name, value in lossd.get("stats", {}).items():
         if not name.startswith("_"):
             tb.add_scalar(f"step/{name}", value, step)
@@ -594,8 +654,8 @@ def log_step_diagnostics(tb, net, lossd, step, xc, yc, extras):
     for group, norm in grad_norms(net).items():
         tb.add_scalar(f"gradient/{group}", norm, step)
 
-    # Hai backward phụ trên chính batch này: cần biết lambda đang đặt gradient align ở đâu so
-    # với gradient grasp *trên cùng dữ liệu*, chứ không phải trên một batch khác.
+    # Two extra backward passes on this very batch: we need to know where lambda puts the
+    # align gradient relative to the grasp gradient *on the same data*, not on another batch.
     if "part_mask" in extras and "prompts" in extras:
         split = grad_norm_split(net, xc, yc, extras["prompts"], extras["part_mask"])
         for name, value in split.items():
@@ -603,7 +663,8 @@ def log_step_diagnostics(tb, net, lossd, step, xc, yc, extras):
 
 
 def log_epoch(tb, epoch, train_results, val_results, lr, lambda_align):
-    """Toàn bộ scalar theo epoch, đặt tên theo nhóm để TensorBoard gộp đúng biểu đồ."""
+    """All per-epoch scalars, named by group so TensorBoard collates the right charts."""
+
     def grasp_part(losses):
         return sum(losses.get(k, 0.0) for k in GRASP_LOSSES)
 
@@ -612,8 +673,8 @@ def log_epoch(tb, epoch, train_results, val_results, lr, lambda_align):
     tb.add_scalar("loss/val/total", val_results["loss"], epoch)
     tb.add_scalar("loss/val/grasp", grasp_part(val_results["losses"]), epoch)
     for name in ("align_bce", "align_dice"):
-        # Warmup làm *tổng* đi lên trong lúc từng thành phần đang đi xuống -- nhìn tổng thôi
-        # thì đọc nhầm, nên hai thành phần này phải có đường riêng.
+        # Warmup pushes the *total* up while each component goes down -- reading the total
+        # alone is misleading, so these two components get their own curves.
         if name in train_results["losses"]:
             tb.add_scalar(f"loss/train/{name}", train_results["losses"][name], epoch)
         if name in val_results["losses"]:
@@ -626,53 +687,67 @@ def log_epoch(tb, epoch, train_results, val_results, lr, lambda_align):
     for name, value in val_results.get("align", {}).items():
         tb.add_scalar(f"align/{name}", value, epoch)
     for name, value in val_results.get("token", {}).items():
-        # Đã mang sẵn tiền tố token/ hoặc fusion/; đây là trung bình trên *toàn bộ* tập
-        # validation, khác với step/... đo trên một batch train.
+        # These already carry the token/ or fusion/ prefix; this is the average over the
+        # *whole* validation set, unlike step/... which is measured on one training batch.
         tb.add_scalar(name, value, epoch)
 
     tally = val_results.get("tally")
     if tally is not None and tally.total:
-        # Token thắng nhiều pixel nhất trên cả tập val. Nếu top toàn danh từ object thì model
-        # đang định vị object chứ không phải part.
+        # Tokens winning the most pixels across the validation set. If the top entries are all
+        # object nouns, the model is localising the object rather than the part.
         tb.add_text("token/winning", tally.as_text(20).replace("\n", "\n\n"), epoch)
         tb.add_scalar("token/punctuation_mass", tally.punctuation_mass(), epoch)
-        logging.info("token thắng nhiều nhất: "
-                     + ", ".join(f"{t} {p:.1%}" for t, p in tally.top(5)))
+        logging.info(
+            "top winning tokens: "
+            + ", ".join(f"{t} {p:.1%}" for t, p in tally.top(5))
+        )
 
 
-def log_counterfactual(tb, net, device, loaders, epoch, iou_threshold,
-                       amp_dtype=None, channels_last=False):
+def log_counterfactual(
+    tb, net, device, loaders, epoch, iou_threshold, amp_dtype=None, channels_last=False
+):
     """
-    Đối chứng: prompt đúng / prompt hoán vị / một prompt cố định cho mọi ảnh.
+    Counterfactual: correct prompt / shuffled prompt / one fixed prompt for every image.
 
-    Δ_prompt = S_normal - S_shuffled. Gần 0 thì không kết luận được nhánh ngôn ngữ có ích,
-    dù align_loss có thấp đến đâu -- đây là con số quan trọng hơn mọi đường loss.
+    Delta_prompt = S_normal - S_shuffled. Near 0 means nothing can be concluded about the
+    language branch being useful, however low align_loss got -- this number matters more than
+    any loss curve.
     """
     scores = {}
     for name, loader in loaders.items():
         if loader is None:
             continue
-        scores[name] = validate(net, device, loader, iou_threshold, amp_dtype=amp_dtype,
-                                channels_last=channels_last)["accuracy"]
+        scores[name] = validate(
+            net,
+            device,
+            loader,
+            iou_threshold,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+        )["accuracy"]
         tb.add_scalar(f"counterfactual/{name}_success", scores[name], epoch)
 
     if "normal" in scores and "shuffled" in scores:
         drop = scores["normal"] - scores["shuffled"]
         tb.add_scalar("counterfactual/prompt_drop", drop, epoch)
-        logging.info("counterfactual: " + "  ".join(f"{k}={v:.4f}" for k, v in scores.items())
-                     + f"  Δ_prompt={drop:+.4f}")
+        logging.info(
+            "counterfactual: "
+            + "  ".join(f"{k}={v:.4f}" for k, v in scores.items())
+            + f"  Δ_prompt={drop:+.4f}"
+        )
     return scores
 
 
 def save_probe_figures(net, dataset, indices, folder, epoch, tb=None):
     """
-    Probe set *cố định*: cùng những sample đó, epoch nào cũng vẽ lại.
+    A *fixed* probe set: the same samples, redrawn at every epoch.
 
-    Đổi sample giữa các epoch thì không so sánh được -- mà thứ cần thấy chính là attention bắt
-    đầu học từ lúc nào, có collapse sau warmup không, và grasp có tốt lên theo hay chỉ mỗi mask
-    đẹp lên.
+    Changing samples between epochs makes them incomparable -- and what we need to see is
+    exactly when attention starts to learn, whether it collapses after warmup, and whether the
+    grasp improves along with it or only the mask gets prettier.
     """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -684,22 +759,28 @@ def save_probe_figures(net, dataset, indices, folder, epoch, tb=None):
     try:
         for k, idx in enumerate(indices):
             fig, info = plot_sample_diagnostics(net, dataset, idx)
-            fig.savefig(os.path.join(folder, f"probe_{k:02d}_epoch_{epoch:03d}.png"),
-                        dpi=110, bbox_inches="tight")
+            fig.savefig(
+                os.path.join(folder, f"probe_{k:02d}_epoch_{epoch:03d}.png"),
+                dpi=110,
+                bbox_inches="tight",
+            )
             if tb is not None:
                 tb.add_figure(f"probe/{k:02d}", fig, epoch)
             plt.close(fig)
             if k == 0:
                 logging.info(f"probe 00: IoU={info['iou']:.3f} tokens={info['tokens']}")
 
-        # Cùng một ảnh, đổi prompt: hình quan trọng nhất: nếu ba hàng giống hệt nhau thì model
-        # đang bỏ qua ngôn ngữ.
+        # Same image, different prompts -- the most important figure: if the three rows are
+        # identical, the model is ignoring the language.
         if indices and getattr(net, "use_text", False):
             idx = indices[0]
             prompts = probe_prompts(dataset, idx)
             fig = plot_prompt_grid(net, dataset, idx, prompts)
-            fig.savefig(os.path.join(folder, f"prompt_grid_epoch_{epoch:03d}.png"),
-                        dpi=110, bbox_inches="tight")
+            fig.savefig(
+                os.path.join(folder, f"prompt_grid_epoch_{epoch:03d}.png"),
+                dpi=110,
+                bbox_inches="tight",
+            )
             if tb is not None:
                 tb.add_figure("probe/prompt_grid", fig, epoch)
             plt.close(fig)
@@ -709,17 +790,20 @@ def save_probe_figures(net, dataset, indices, folder, epoch, tb=None):
 
 def probe_prompts(dataset, idx):
     """
-    Prompt thật + prompt của các part khác *cùng object* + một prompt trung tính.
+    The real prompt + prompts of other parts of the *same object* + a neutral prompt.
 
-    Ba nguồn này tách được ba mức: đúng part, sai part nhưng đúng vật, và không nói gì cụ thể.
+    These three separate three levels: right part, wrong part but right object, and nothing
+    specific said at all.
     """
-    prompts = [("thật", dataset.get_prompt(idx, use_permutation=False))]
+    prompts = [("real", dataset.get_prompt(idx, use_permutation=False))]
     object_id = dataset._object_id(dataset.sample_id(idx))
     for path in dataset._files_by_object.get(object_id, [])[:3]:
         other = dataset.grasp_files.index(path)
         if other != idx:
-            prompts.append(("part khác", dataset.get_prompt(other, use_permutation=False)))
-    prompts.append(("trung tính", "Grasp the object."))
+            prompts.append(
+                ("other part", dataset.get_prompt(other, use_permutation=False))
+            )
+    prompts.append(("neutral", "Grasp the object."))
     return prompts[:4]
 
 
@@ -761,8 +845,9 @@ def run():
     # Get the compute device
     device = get_device(args.force_cpu)
 
-    # Cấu hình backend. Input size cố định suốt run nên `cudnn.benchmark` chỉ dò thuật toán ở
-    # vài batch đầu rồi dùng lại mãi; nếu shape thay đổi liên tục thì cờ này lại phản tác dụng.
+    # Backend configuration. The input size is fixed for the whole run, so `cudnn.benchmark`
+    # only searches during the first few batches and reuses the result; with constantly
+    # changing shapes the flag would backfire.
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
         if args.tf32:
@@ -770,20 +855,23 @@ def run():
             torch.backends.cudnn.allow_tf32 = True
 
     amp_dtype = resolve_amp(args.amp, device)
-    # fp16 cần GradScaler; bf16 thì không (cùng dải mũ với fp32). GradScaler tạo sẵn nhưng
-    # `enabled=False` để nhánh code phía dưới không phải rẽ hai lần.
+    # fp16 needs a GradScaler; bf16 does not (same exponent range as fp32). The GradScaler is
+    # created anyway with `enabled=False`, so the code below needs only one branch.
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is torch.float16)
     if args.channels_last == "auto":
         channels_last = amp_dtype is not None and device.type == "cuda"
     else:
         channels_last = bool(int(args.channels_last))
-    logging.info("Precision: %s | channels_last=%s | cudnn.benchmark=%s",
-                 "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
-                 channels_last, torch.backends.cudnn.benchmark)
+    logging.info(
+        "Precision: %s | channels_last=%s | cudnn.benchmark=%s",
+        "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
+        channels_last,
+        torch.backends.cudnn.benchmark,
+    )
     if amp_dtype is not None:
         logging.warning(
-            "AMP đang BẬT: loss và accuracy sẽ lệch nhẹ so với run fp32 thuần. Ghi rõ điều "
-            "này khi so bảng với các run cũ (giá trị nằm trong commandline_args.json)."
+            "AMP is ON: loss and accuracy will differ slightly from a pure fp32 run. Say so "
+            "when comparing tables with older runs (the setting is in commandline_args.json)."
         )
 
     # Load Dataset
@@ -798,26 +886,33 @@ def run():
         include_rgb=args.use_rgb,
         seen=args.seen,
     )
-    # Chỉ truyền khi có, vì các loader khác (cornell/jacquard/...) không nhận kwarg này.
+    # Only passed when set, because the other loaders (cornell/jacquard/...) reject this kwarg.
     if args.split_path:
         ds_kwargs["split_path"] = args.split_path
 
-    # Tokenizer phải gắn vào dataset *trước* khi dựng DataLoader: với persistent_workers,
-    # worker đã fork rồi thì gán thêm thuộc tính ở tiến trình chính không lan sang được (cùng
-    # cái bẫy đã ghi ở phần counterfactual bên dưới).
-    if (args.use_text and args.tokenize_in_loader and args.num_workers > 0
-            and "prompt_tokenizer" in inspect.signature(Dataset.__init__).parameters):
+    # The tokenizer has to be attached to the dataset *before* the DataLoader is built: with
+    # persistent_workers, once the workers have forked, attributes set in the main process no
+    # longer propagate (the same trap noted for the counterfactual loaders below).
+    if (
+        args.use_text
+        and args.tokenize_in_loader
+        and args.num_workers > 0
+        and "prompt_tokenizer" in inspect.signature(Dataset.__init__).parameters
+    ):
         try:
-            from inference.models.grconvnet3_align import PromptTokenizer
+            from inference.models.stag import PromptTokenizer
 
             ds_kwargs["prompt_tokenizer"] = PromptTokenizer()
-            logging.info("Tokenize prompt trong DataLoader worker.")
-        except Exception as exc:      # thiếu transformers / không tải được checkpoint CLIP
-            logging.warning("Không dựng được PromptTokenizer (%s); tokenize trong tiến "
-                            "trình chính như cũ.", exc)
+            logging.info("Tokenizing prompts inside the DataLoader workers.")
+        except Exception as exc:  # transformers missing / CLIP checkpoint not downloadable
+            logging.warning(
+                "Could not build a PromptTokenizer (%s); falling back to tokenizing in the "
+                "main process.",
+                exc,
+            )
 
     dataset = Dataset(args.dataset_path, **ds_kwargs)
-    # Validation phải chạy trên dữ liệu *không* augmentation: xem GraspDatasetBase.eval_view().
+    # Validation must run on *un-augmented* data: see GraspDatasetBase.eval_view().
     val_dataset = dataset.eval_view()
     logging.info(f"Dataset size is {dataset.length}")
 
@@ -832,27 +927,28 @@ def run():
     train_indices, val_indices = splits["train"], splits["val"]
     logging.info(f"Index splits: {describe(splits)}")
     if splits["test"]:
-        # Ghi rõ ra log để `evaluate.py --subset test` tái lập được đúng lát cắt này.
+        # Logged explicitly so `evaluate.py --subset test` can reproduce this exact slice.
         logging.info(
-            "Test set giữ nguyên, không dùng để train hay chọn checkpoint. Đánh giá bằng: "
+            "Test set held out, used neither for training nor checkpoint selection. "
+            "Evaluate it with: "
             f"evaluate.py --subset test --split {args.split} --test-split {args.test_split}"
             f"{' --ds-shuffle' if args.ds_shuffle else ''} --random-seed {args.random_seed}"
         )
     else:
         logging.warning(
-            "--test-split 0.0: không có tập test độc lập. Chỉ số 'test' báo cáo sau này sẽ "
-            "chính là tập validation đã dùng để chọn checkpoint."
+            "--test-split 0.0: no held-out test set. Any 'test' number reported later will be "
+            "the very validation set used to select the checkpoint."
         )
 
     # Creating data samplers and loaders
     train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_indices)
     val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
 
-    # train() tạo lại iterator sau mỗi vòng `while batch_idx <= batches_per_epoch`, nên
-    # persistent_workers tiết kiệm hẳn việc spawn lại worker. Loader của GA++ nặng CPU
-    # (decode JPEG + rotate/zoom cho ảnh, part_mask và M_union) nên prefetch cũng đáng.
+    # train() rebuilds the iterator on every pass of `while batch_idx < batches_per_epoch`, so
+    # persistent_workers saves respawning the workers each time. The GA++ loader is CPU-heavy
+    # (JPEG decode + rotate/zoom for the image, part_mask and M_union), so prefetching pays too.
     if args.prefetch_factor < 1:
-        raise ValueError("--prefetch-factor phải >= 1")
+        raise ValueError("--prefetch-factor must be >= 1")
 
     train_loader_kwargs = dict(num_workers=args.num_workers)
     eval_loader_kwargs = dict(num_workers=args.num_workers)
@@ -862,9 +958,10 @@ def run():
             prefetch_factor=args.prefetch_factor,
             pin_memory=True,
         )
-        # Có ba loader eval (normal/shuffled/fixed). Nếu tất cả đều persistent thì sau
-        # counterfactual ta giữ tới 4*num_workers process cùng các queue/pinned batch. Cho
-        # eval worker kết thúc sau mỗi lượt để RAM không tăng theo số condition.
+        # There are three eval loaders (normal/shuffled/fixed). If they were all persistent,
+        # after a counterfactual pass we would hold up to 4*num_workers processes along with
+        # their queues and pinned batches. Letting eval workers exit after each pass keeps RAM
+        # from growing with the number of conditions.
         eval_loader_kwargs.update(
             persistent_workers=False,
             prefetch_factor=min(args.prefetch_factor, 2),
@@ -884,11 +981,15 @@ def run():
         **eval_loader_kwargs,
     )
 
-    # Loader đối chứng phải dựng *ở đây*: với persistent_workers, đổi thuộc tính dataset ở
-    # tiến trình chính sau khi worker đã fork thì worker không thấy -- prompt vẫn là prompt
-    # thật và số đo sẽ vô nghĩa.
+    # The counterfactual loaders must be built *here*: with persistent_workers, changing a
+    # dataset attribute in the main process after the workers have forked is invisible to them
+    # -- the prompts would still be the real ones and the measurement meaningless.
     counterfactual_loaders = {"normal": val_data}
-    if args.counterfactual_every and hasattr(val_dataset, "shuffle_prompts") and args.use_text:
+    if (
+        args.counterfactual_every
+        and hasattr(val_dataset, "shuffle_prompts")
+        and args.use_text
+    ):
         shuffled = val_dataset.eval_view().shuffle_prompts(seed=args.random_seed)
         fixed = val_dataset.eval_view().set_fixed_prompt(args.fixed_prompt)
         counterfactual_loaders["shuffled"] = torch.utils.data.DataLoader(
@@ -931,7 +1032,7 @@ def run():
         net = net.to(memory_format=torch.channels_last)
     logging.info("Done")
 
-    # CLIP text encoder bị đóng băng -> lọc ra khỏi optimizer cho gọn.
+    # The CLIP text encoder is frozen -> keep it out of the optimizer.
     params = [p for p in net.parameters() if p.requires_grad]
     if args.optim.lower() == "adam":
         optimizer = optim.Adam(params, lr=args.lr if args.lr else 1e-3)
@@ -958,19 +1059,23 @@ def run():
     # sys.stdout = sys.__stdout__
     # f.close()
 
-    # Probe set cố định, lấy từ tập validation: cùng những sample này ở mọi epoch.
-    probe_indices = sorted(val_indices)[: args.probe_samples] if args.probe_samples else []
+    # Fixed probe set, taken from the validation split: the same samples at every epoch.
+    probe_indices = (
+        sorted(val_indices)[: args.probe_samples] if args.probe_samples else []
+    )
     probe_epochs = {int(e) for e in args.probe_epochs.split(",") if e.strip()}
     figures_dir = os.path.join(save_folder, "figures")
     if probe_indices:
-        logging.info(f"Probe set: {len(probe_indices)} sample, vẽ ở epoch "
-                     f"{sorted(probe_epochs)} và ở mỗi epoch tốt nhất")
+        logging.info(
+            f"Probe set: {len(probe_indices)} samples, drawn at epochs "
+            f"{sorted(probe_epochs)} and at every new best epoch"
+        )
 
     best_iou = 0.0
     for epoch in range(args.epochs):
         logging.info(f"Beginning Epoch {epoch:02d}")
         if hasattr(net, "set_loss_warmup"):
-            # L_align vào dần: A_T lúc đầu ngẫu nhiên, ép mạnh sẽ kéo hỏng nhánh grasp.
+            # Phase L_align in: A_T is random at first, forcing it hard would wreck the grasp branch.
             net.set_loss_warmup(min(1.0, (epoch + 1) / max(1, args.warmup_epochs)))
         train_results = train(
             epoch,
@@ -989,33 +1094,61 @@ def run():
 
         # Run Validation
         logging.info("Validating...")
-        test_results = validate(net, device, val_data, args.iou_threshold, diagnostics=True,
-                                amp_dtype=amp_dtype, channels_last=channels_last)
+        test_results = validate(
+            net,
+            device,
+            val_data,
+            args.iou_threshold,
+            diagnostics=True,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+        )
         iou = test_results["accuracy"]
-        logging.info("%d/%d = %f" % (test_results["correct"],
-                                     test_results["correct"] + test_results["failed"], iou))
+        logging.info(
+            "%d/%d = %f"
+            % (
+                test_results["correct"],
+                test_results["correct"] + test_results["failed"],
+                iou,
+            )
+        )
         if test_results["align"]:
-            logging.info("align: " + "  ".join(f"{k}={v:.4f}"
-                                               for k, v in test_results["align"].items()))
+            logging.info(
+                "align: "
+                + "  ".join(f"{k}={v:.4f}" for k, v in test_results["align"].items())
+            )
 
-        log_epoch(tb, epoch, train_results, test_results,
-                  optimizer.param_groups[0]["lr"], getattr(net, "lambda_align", 0.0))
+        log_epoch(
+            tb,
+            epoch,
+            train_results,
+            test_results,
+            optimizer.param_groups[0]["lr"],
+            getattr(net, "lambda_align", 0.0),
+        )
 
         if args.counterfactual_every and (epoch + 1) % args.counterfactual_every == 0:
-            log_counterfactual(tb, net, device, counterfactual_loaders, epoch,
-                               args.iou_threshold, amp_dtype=amp_dtype,
-                               channels_last=channels_last)
+            log_counterfactual(
+                tb,
+                net,
+                device,
+                counterfactual_loaders,
+                epoch,
+                args.iou_threshold,
+                amp_dtype=amp_dtype,
+                channels_last=channels_last,
+            )
 
         # Save best performing network
-        # `best_iou` chỉ được cập nhật khi thật sự tốt hơn. Bản cũ đặt nó bên trong nhánh
-        # `or (epoch % 10) == 0`, nên mỗi epoch chia hết cho 10 lại hạ mốc xuống một giá trị
-        # có thể tệ hơn, khiến các epoch sau đó được lưu như "best" giả.
+        # `best_iou` is only updated on a genuine improvement. Upstream updates it inside the
+        # `or (epoch % 10) == 0` branch, so every tenth epoch lowers the bar to a possibly
+        # worse value and later epochs get saved as spurious "best" checkpoints.
         is_best = iou > best_iou
         if is_best or epoch == 0 or (epoch % 10) == 0:
-            # 4 chữ số thập phân: %0.2f làm tròn khiến nhiều epoch trùng tên và phải grep log
-            # mới biết checkpoint nào thật sự tốt nhất.
-            # save_checkpoint lưu state_dict + kwargs, bỏ CLIP text tower: ~9 MB thay vì
-            # 265 MB mỗi file (utils/checkpoint.py).
+            # Four decimals: %0.2f rounds several epochs to the same filename, forcing a log
+            # grep to find which checkpoint is actually best.
+            # save_checkpoint stores state_dict + kwargs without the CLIP text tower: ~9 MB
+            # per file instead of 265 MB (utils/checkpoint.py).
             save_checkpoint(
                 net, os.path.join(save_folder, "epoch_%02d_iou_%0.4f" % (epoch, iou))
             )
@@ -1024,17 +1157,26 @@ def run():
             logging.info(f"New best IoU {best_iou:.4f} at epoch {epoch}")
 
         if probe_indices and (epoch in probe_epochs or is_best):
-            save_probe_figures(net, val_dataset, probe_indices, figures_dir, epoch, tb=tb)
+            save_probe_figures(
+                net, val_dataset, probe_indices, figures_dir, epoch, tb=tb
+            )
 
         if scheduler is not None:
             scheduler.step()
 
-    # Đối chứng lần cuối trên model cuối cùng, kể cả khi lịch --counterfactual-every không rơi
-    # đúng epoch cuối: đây là con số đi vào báo cáo.
+    # One final counterfactual on the final model, even when the --counterfactual-every
+    # schedule does not land on the last epoch: this is the number that goes into the report.
     if args.counterfactual_every:
-        log_counterfactual(tb, net, device, counterfactual_loaders, args.epochs - 1,
-                           args.iou_threshold, amp_dtype=amp_dtype,
-                           channels_last=channels_last)
+        log_counterfactual(
+            tb,
+            net,
+            device,
+            counterfactual_loaders,
+            args.epochs - 1,
+            args.iou_threshold,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+        )
     tb.flush()
 
 

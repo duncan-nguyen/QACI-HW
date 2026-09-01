@@ -1,20 +1,21 @@
-"""Kiểm tra dữ liệu GA++ **trước** khi train -- chạy một lần, đọc kỹ, rồi mới tốn GPU.
+"""Inspect the GA++ data **before** training -- run it once, read it carefully, then spend GPU.
 
-Ba thứ có thể làm hỏng cả thí nghiệm mà không hề báo lỗi:
+Three things can ruin the whole experiment without raising any error:
 
-1. `part_mask` thật ra ở mức *object*: mọi part của cùng một object có mask giống hệt nhau.
-   Khi đó `L_align` không chứa thông tin phân biệt part, và mọi cải tiến ở phía kiến trúc
-   alignment đều bị chặn trên. Ngưỡng cảnh báo: phần lớn cặp part cùng object có IoU > 0.9.
-2. Foreground quá nhỏ (hoặc quá lớn): quyết định việc Dice có cần thiết không, và giá trị
-   `align_bce` quan sát được nên so với mốc nào ("đoán toàn 0" cho BCE bằng bao nhiêu).
-3. Prompt còn lại bao nhiêu token sau khi loại SOT/EOT/pad/dấu câu -- đó chính là số candidate
-   mà softmax theo token phải chọn giữa. Nếu trung bình chỉ 2-3 token thì entropy tối đa cũng
-   chỉ ~1.0, đừng kỳ vọng attention "tập trung" mang nhiều ý nghĩa.
+1. `part_mask` is actually at *object* level: every part of an object has the same mask. Then
+   `L_align` carries no part-distinguishing information and every improvement on the alignment
+   architecture is capped. Warning threshold: most same-object part pairs have IoU > 0.9.
+2. The foreground is too small (or too large): this decides whether Dice is necessary, and what
+   baseline the observed `align_bce` should be compared against (what BCE the all-zero
+   prediction achieves).
+3. How many tokens survive in a prompt after SOT/EOT/pad/punctuation are removed -- exactly the
+   number of candidates the softmax over tokens must choose between. If the average is only 2-3
+   tokens, the maximum entropy is only ~1.0, so do not read much into "concentrated" attention.
 
     python script/check_dataset.py --data-dir data/grasp-anything-pp-200k \\
         --split-path split/grasp-anything-pp --out results/dataset-check
 
-Báo cáo sâu hơn về riêng câu hỏi (1), kèm ví dụ để soi tay:
+A deeper report on question (1) alone, with examples for manual inspection:
 `python script/diagnose_part_masks.py --data-dir <...>`.
 """
 import argparse
@@ -42,22 +43,22 @@ def parse_args():
     p.add_argument("--seen", type=int, default=1)
     p.add_argument("--input-size", type=int, default=224)
     p.add_argument("--n-objects", type=int, default=1000,
-                   help="Số object (có ≥2 part) lấy mẫu cho thống kê mask")
+                   help="Objects (with >=2 parts) to sample for the mask statistics")
     p.add_argument("--n-prompts", type=int, default=2000,
-                   help="Số prompt lấy mẫu để đếm token")
-    p.add_argument("--n-grid", type=int, default=24, help="Số ô của lưới ảnh kiểm tra bằng mắt")
+                   help="Prompts to sample for the token count")
+    p.add_argument("--n-grid", type=int, default=24, help="Cells in the visual inspection grid")
     p.add_argument("--no-clip", action="store_true",
-                   help="Bỏ phần đếm token (khỏi phải nạp CLIP)")
-    p.add_argument("--out", default=None, help="Thư mục ghi JSON + PNG")
+                   help="Skip the token count (avoids loading CLIP)")
+    p.add_argument("--out", default=None, help="Directory for the JSON + PNG output")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
 
 def mask_report(data_dir, n_objects, seed, threshold=0.9):
-    """Foreground, IoU giữa các part cùng object, tỉ lệ mask trùng nhau."""
+    """Foreground, IoU between parts of one object, and the rate of identical masks."""
     files = glob.glob(os.path.join(data_dir, "part_mask", "*.npy"))
     if not files:
-        raise SystemExit(f"Không thấy part_mask/*.npy trong {data_dir}")
+        raise SystemExit(f"No part_mask/*.npy found in {data_dir}")
 
     by_object = collections.defaultdict(list)
     for f in files:
@@ -80,7 +81,7 @@ def mask_report(data_dir, n_objects, seed, threshold=0.9):
         n_pairs += len(pairs)
         identical += int(min(pairs) >= threshold)
 
-    # Với subset nhỏ có thể không object nào có ≥2 part -- vẫn báo được foreground.
+    # On a small subset no object may have >=2 parts -- the foreground can still be reported.
     if not fg:
         fg = [float(load_mask(f).mean()) for f in files[:n_objects or len(files)]]
 
@@ -101,8 +102,8 @@ def mask_report(data_dir, n_objects, seed, threshold=0.9):
 
 
 def token_report(dataset, n_prompts, seed):
-    """Số token nội dung mỗi prompt (sau khi bỏ SOT/EOT/pad/dấu câu) + token hay gặp."""
-    from inference.models.grconvnet3_align import CLIPTextEncoder
+    """Content tokens per prompt (after dropping SOT/EOT/pad/punctuation) + frequent tokens."""
+    from inference.models.stag import CLIPTextEncoder
 
     rng = random.Random(seed)
     n = len(dataset.grasp_files)
@@ -129,7 +130,7 @@ def token_report(dataset, n_prompts, seed):
         "n_empty_prompts": sum(c == 0 for c in counts),
         "distinct_tokens": len(tally),
         "most_common": tally.most_common(15),
-        # log(L): mốc trên của token/attention_entropy trong TensorBoard.
+        # log(L): the upper bound on token/attention_entropy in TensorBoard.
         "max_entropy": float(np.log(max(1, statistics.mean(counts)))),
     }, prompts
 
@@ -168,15 +169,18 @@ def main():
     identical = masks["frac_objects_all_parts_identical"]
     above = masks["frac_pairs_above_0.9"]
     if above is not None and above > 0.5:
-        print("\n  CẢNH BÁO: hơn một nửa cặp part cùng object có IoU > 0.9 -- supervision thực")
-        print("  tế gần mức OBJECT hơn mức part. L_align không dạy được grounding part-level,")
-        print("  và Δ_prompt trong đối chứng sẽ nhỏ dù model không có lỗi gì.")
+        print("\n  WARNING: more than half of same-object part pairs have IoU > 0.9 -- the real")
+        print("  supervision is closer to OBJECT level than part level. L_align cannot teach")
+        print("  part-level grounding, and Delta_prompt in the counterfactual will be small even")
+        print("  with a perfectly good model.")
     elif identical is not None and identical > 0.15:
-        print("\n  Lưu ý: một phần đáng kể object có mọi part trùng mask; cân nhắc lọc chúng")
-        print("  khỏi L_align. Chi tiết + ví dụ: script/diagnose_part_masks.py")
-    # BCE của nghiệm tầm thường "đoán toàn 0" -- mốc để biết align_bce quan sát được có nghĩa gì.
+        print("\n  Note: a sizeable fraction of objects have all parts sharing one mask; consider")
+        print("  filtering them out of L_align. Details + examples: script/diagnose_part_masks.py")
+    # The BCE of the trivial all-zero prediction -- the baseline that makes the observed
+    # align_bce meaningful.
     fg = masks["fg_frac_median"]
-    print(f"\n  Mốc tham chiếu: foreground {fg:.2%} -> 'đoán toàn 0' cho BCE ≈ {-np.log(1 - fg):.4f}"
+    print(f"\n  Reference: foreground {fg:.2%} -> the all-zero prediction gives "
+          f"BCE ~ {-np.log(1 - fg):.4f}"
           if fg < 1 else "")
 
     tokens = None
@@ -185,15 +189,15 @@ def main():
         tokens, _ = token_report(dataset, args.n_prompts, args.seed)
         for k, v in tokens.items():
             if k == "most_common":
-                print("  token hay gặp nhất:")
+                print("  most frequent tokens:")
                 print("    " + ", ".join(f"{t} {c}" for t, c in v))
             else:
                 print(f"  {k:34} {v if not isinstance(v, float) else f'{v:.3f}'}")
         if tokens["n_empty_prompts"]:
-            print(f"\n  CẢNH BÁO: {tokens['n_empty_prompts']} prompt không còn token nào sau khi")
-            print("  lọc -- model sẽ nhận A_T = 0 cho chúng.")
+            print(f"\n  WARNING: {tokens['n_empty_prompts']} prompts have no tokens left after")
+            print("  filtering -- the model receives A_T = 0 for them.")
 
-    print("\n== 3. lưới ảnh ==")
+    print("\n== 3. image grid ==")
     result = {"split": "seen" if args.seen else "unseen", "part_mask": masks, "prompt": tokens}
     if args.out:
         os.makedirs(args.out, exist_ok=True)
@@ -205,7 +209,7 @@ def main():
             json.dump(result, f, indent=2)
         print(f"  {path}")
     else:
-        print("  (bỏ qua -- truyền --out để ghi hình)")
+        print("  (skipped -- pass --out to write the figures)")
 
 
 if __name__ == "__main__":

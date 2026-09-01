@@ -1,8 +1,9 @@
-"""Đo throughput của dataloader theo số worker, để chọn --num-workers bằng số liệu.
+"""Measure dataloader throughput against worker count, to pick --num-workers from data.
 
-Với GR-ConvNet (1,9M tham số) thì GPU gần như không bao giờ là chỗ nghẽn -- kể cả H200. Cái
-quyết định thời gian train là dataloader trên CPU: mỗi sample phải decode JPEG, rotate/zoom
-ảnh + part_mask, và rasterize M_union. Script này quét vài giá trị worker rồi in sample/s.
+With GR-ConvNet (1.9M parameters) the GPU is almost never the bottleneck -- not even an H200.
+What determines training time is the CPU dataloader: every sample decodes a JPEG, rotates/zooms
+the image and part_mask, and rasterizes M_union. This script sweeps a few worker counts and
+prints samples/s.
 
     python script/bench_loader.py --dataset-path data/grasp-anything-pp-full \
         --split-path split/grasp-anything-pp --workers 8,16,32,48
@@ -27,9 +28,9 @@ def parse_args():
     p.add_argument("--dataset", default="grasp-anything-pp")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--input-size", type=int, default=224)
-    p.add_argument("--batches", type=int, default=30, help="Số batch đo mỗi mức worker")
+    p.add_argument("--batches", type=int, default=30, help="Batches timed at each worker count")
     p.add_argument("--workers", default=None,
-                   help="Danh sách cách nhau bởi dấu phẩy (mặc định: suy từ số core)")
+                   help="Comma-separated list (default: derived from the core count)")
     p.add_argument("--seen", type=int, default=1)
     return p.parse_args()
 
@@ -50,7 +51,7 @@ def main():
     dataset = get_dataset(args.dataset)(args.dataset_path, **ds_kwargs)
     print(f"{len(dataset):,} sample, {nproc} core, batch {args.batch_size}\n")
 
-    print(f"{'workers':>8} {'sample/s':>10} {'ms/batch':>10}   {'1 lượt qua dữ liệu':>20}")
+    print(f"{'workers':>8} {'samples/s':>10} {'ms/batch':>10}   {'one pass over data':>20}")
     best = (0, 0.0)
     for workers in levels:
         loader = torch.utils.data.DataLoader(
@@ -60,7 +61,7 @@ def main():
 
         t0, n, nb = None, 0, 0
         for batch in loader:
-            if t0 is None:      # batch đầu gánh chi phí spawn worker, không tính
+            if t0 is None:      # the first batch pays the worker spawn cost; not counted
                 t0 = time.time()
                 continue
             n += batch[0].shape[0]
@@ -70,13 +71,13 @@ def main():
         dt = time.time() - t0
         rate = n / dt if dt > 0 else 0.0
         hours = len(dataset) / rate / 3600 if rate else float("inf")
-        print(f"{workers:>8} {rate:>10.0f} {dt / max(nb, 1) * 1000:>10.0f}   {hours:>17.2f} giờ")
+        print(f"{workers:>8} {rate:>10.0f} {dt / max(nb, 1) * 1000:>10.0f}   {hours:>17.2f} h")
         if rate > best[1]:
             best = (workers, rate)
         del loader
 
-    print(f"\nTốt nhất: --num-workers {best[0]}  ({best[1]:.0f} sample/s)")
-    print("Nếu sample/s vẫn tăng ở mức worker cao nhất thì thử thêm mức cao hơn nữa.")
+    print(f"\nBest: --num-workers {best[0]}  ({best[1]:.0f} samples/s)")
+    print("If samples/s is still rising at the highest worker count, try higher values.")
 
 
 if __name__ == "__main__":

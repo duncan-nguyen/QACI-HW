@@ -1,20 +1,21 @@
-"""Kiểm tra `part_mask` của Grasp-Anything++ có thật sự ở mức *part* hay chỉ ở mức *object*.
+"""Check whether Grasp-Anything++'s `part_mask` is really at *part* level or only at *object* level.
 
-Lý do: `results/.../figures/parts_same_object.png` cho thấy bốn prompt khác nhau trên cùng
-một quả táo -- "by its skin", "by its flesh", "by its seeds", "on its stem" -- có `part_mask`
-**giống hệt nhau**, đều là toàn bộ quả táo. Nếu đó là hiện tượng phổ biến chứ không phải cá
-biệt, thì `L_align(A_T, part_mask)` không thể dạy grounding mức part: tín hiệu giám sát không
-chứa thông tin về part. Script này đo tỉ lệ đó trên toàn dataset.
+The motivation: `results/.../figures/parts_same_object.png` shows four different prompts on the
+same apple -- "by its skin", "by its flesh", "by its seeds", "on its stem" -- with **identical**
+`part_mask`s, all covering the whole apple. If that is common rather than exceptional, then
+`L_align(A_T, part_mask)` cannot teach part-level grounding: the supervision signal carries no
+part information. This script measures that rate over the whole dataset.
 
-Ba số cần đọc:
+Three numbers to read:
 
-* `identical`  -- tỉ lệ object mà **mọi** part có mask trùng nhau (IoU ≥ --iou-identical).
-                  Cao nghĩa là nhãn ở mức object, luận điểm part-level không giám sát được.
-* `part≈union` -- tỉ lệ part mà mask của nó xấp xỉ hợp của mọi part cùng object. Cùng ý nghĩa,
-                  đo trên từng part thay vì từng object.
-* `fg_frac`    -- tỉ lệ diện tích foreground, để quy đổi giá trị `align_loss` quan sát được.
+* `identical`  -- the fraction of objects where **every** part has the same mask
+                  (IoU >= --iou-identical). High means the labels are at object level and the
+                  part-level claim cannot be supervised.
+* `part~union` -- the fraction of parts whose mask approximates the union of every part of the
+                  same object. Same meaning, measured per part rather than per object.
+* `fg_frac`    -- the foreground area fraction, for interpreting the observed `align_loss`.
 
-Chỉ dùng numpy, không cần torch/GPU:
+numpy only, no torch/GPU required:
 
     python script/diagnose_part_masks.py --data-dir data/grasp-anything-pp-200k --n-objects 2000
 """
@@ -30,7 +31,7 @@ import statistics
 
 import numpy as np
 
-# Ảnh và part_mask của Grasp-Anything luôn là 416x416 (xem utils/data/grasp_anything_pp_data.py).
+# Grasp-Anything images and part_masks are always 416x416 (see utils/data/grasp_anything_pp_data.py).
 SOURCE_SIZE = 416
 
 
@@ -38,33 +39,33 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--data-dir", required=True, help="Thư mục GA++ (chứa part_mask/)")
+    p.add_argument("--data-dir", required=True, help="GA++ directory (holding part_mask/)")
     p.add_argument(
         "--n-objects",
         type=int,
         default=2000,
-        help="Số object (có ≥2 part) lấy mẫu. 0 = tất cả.",
+        help="How many objects (with >=2 parts) to sample. 0 = all of them.",
     )
     p.add_argument(
         "--iou-identical",
         type=float,
         default=0.95,
-        help="Ngưỡng coi hai mask là trùng nhau.",
+        help="IoU above which two masks count as identical.",
     )
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", default=None, help="Ghi kết quả dạng JSON vào file này")
+    p.add_argument("--out", default=None, help="Write the results as JSON to this file")
     p.add_argument(
-        "--examples", type=int, default=5, help="Số ví dụ in kèm prompt để soi tay"
+        "--examples", type=int, default=5, help="How many examples to print with their prompts"
     )
     return p.parse_args()
 
 
 def load_mask(path):
     """
-    part_mask 416x416 uint8, chấp nhận cả bản đóng gói bit.
+    416x416 uint8 part_mask, bit-packed form also accepted.
 
-    Bản gốc: `GraspAnythingPPDataset._load_mask`. Nhân bản ở đây để script chạy được mà không
-    cần import torch.
+    The original is `GraspAnythingPPDataset._load_mask`. Duplicated here so the script runs
+    without importing torch.
     """
     mask = np.load(path)
     if mask.ndim == 1:
@@ -85,26 +86,26 @@ def main():
 
     mask_dir = os.path.join(args.data_dir, "part_mask")
     if not os.path.isdir(mask_dir):
-        raise SystemExit("Không thấy " + mask_dir)
+        raise SystemExit("Not found: " + mask_dir)
 
     files = glob.glob(os.path.join(mask_dir, "*.npy"))
     if not files:
-        raise SystemExit("Không thấy part_mask/*.npy trong " + args.data_dir)
+        raise SystemExit("No part_mask/*.npy found in " + args.data_dir)
 
-    # Gom theo object "<scene>_<object>"; mỗi phần tử là một part.
+    # Group by object "<scene>_<object>"; each element is one part.
     by_object = collections.defaultdict(list)
     for f in files:
         sid = os.path.splitext(os.path.basename(f))[0]
         by_object[sid.rsplit("_", 1)[0]].append(f)
     multi = {k: v for k, v in by_object.items() if len(v) >= 2}
-    print(f"{len(files):,} part mask · {len(by_object):,} object · {len(multi):,} object có ≥2 part")
+    print(f"{len(files):,} part masks · {len(by_object):,} objects · {len(multi):,} with >=2 parts")
     if not multi:
-        raise SystemExit("Không object nào có nhiều hơn một part -- không kiểm được gì.")
+        raise SystemExit("No object has more than one part -- nothing to check.")
 
     keys = sorted(multi)
     if args.n_objects and args.n_objects < len(keys):
         keys = rng.sample(keys, args.n_objects)
-    print(f"lấy mẫu {len(keys):,} object\n")
+    print(f"sampling {len(keys):,} objects\n")
 
     n_identical = 0
     mean_ious, min_ious, part_vs_union, fg_fracs, n_parts = [], [], [], [], []
@@ -140,37 +141,39 @@ def main():
     )
 
     print("=" * 72)
-    print(f"identical   : {n_identical:,}/{len(keys):,} = {frac_identical:.1%} object có MỌI part trùng mask")
-    print(f"              (ngưỡng IoU ≥ {args.iou_identical})")
-    print(f"part≈union  : {frac_part_is_union:.1%} part có mask ≈ hợp của mọi part cùng object")
+    print(f"identical   : {n_identical:,}/{len(keys):,} = {frac_identical:.1%} of objects have "
+          "ALL parts sharing one mask")
+    print(f"              (IoU threshold >= {args.iou_identical})")
+    print(f"part~union  : {frac_part_is_union:.1%} of parts have a mask ~ the union of all "
+          "parts of the object")
     print()
-    print(f"IoU giữa các part cùng object: median {statistics.median(mean_ious):.3f} · "
+    print(f"IoU between parts of one object: median {statistics.median(mean_ious):.3f} · "
           f"p10 {pct(mean_ious, 10):.3f} · p90 {pct(mean_ious, 90):.3f}")
-    print(f"IoU nhỏ nhất trong mỗi object: median {statistics.median(min_ious):.3f}")
-    print(f"số part mỗi object           : median {statistics.median(n_parts):.1f} · "
+    print(f"lowest IoU within each object  : median {statistics.median(min_ious):.3f}")
+    print(f"parts per object               : median {statistics.median(n_parts):.1f} · "
           f"max {max(n_parts)}")
-    print(f"tỉ lệ diện tích foreground   : median {statistics.median(fg_fracs):.4f} · "
+    print(f"foreground area fraction       : median {statistics.median(fg_fracs):.4f} · "
           f"p10 {pct(fg_fracs, 10):.4f} · p90 {pct(fg_fracs, 90):.4f}")
     print("=" * 72)
 
     if frac_identical > 0.5:
-        print("\nKẾT LUẬN: part_mask chủ yếu ở mức OBJECT, không phải mức part.")
-        print("L_align(A_T, part_mask) vì thế không thể dạy grounding mức part -- target không")
-        print("chứa thông tin phân biệt part. Mọi cải tiến ở phía kiến trúc alignment đều bị")
-        print("chặn trên bởi giới hạn này.")
+        print("\nCONCLUSION: part_mask is mostly at OBJECT level, not part level.")
+        print("L_align(A_T, part_mask) therefore cannot teach part-level grounding -- the target")
+        print("carries no information distinguishing parts. Every improvement on the alignment")
+        print("architecture is capped by this limit.")
     elif frac_identical > 0.15:
-        print("\nKẾT LUẬN: một phần đáng kể part_mask ở mức object. Cần lọc bỏ những object đó")
-        print("khỏi L_align, hoặc đánh trọng số theo mức phân biệt giữa các part.")
+        print("\nCONCLUSION: a sizeable fraction of part_masks is at object level. Those objects")
+        print("should be filtered out of L_align, or weighted by how distinguishable their parts are.")
     else:
-        print("\nKẾT LUẬN: part_mask phân biệt được part. Trường hợp quả táo là cá biệt;")
-        print("nguyên nhân A_T không bám part nằm ở phía kiến trúc/đặc trưng thị giác.")
+        print("\nCONCLUSION: part_masks do distinguish parts. The apple case is an exception;")
+        print("if A_T does not track the part, the cause is on the architecture/visual-feature side.")
 
-    # Ví dụ để soi tay, kèm prompt nếu có.
+    # Examples for manual inspection, with their prompts where available.
     prompt_dir = os.path.join(args.data_dir, "grasp_instructions")
     if examples and os.path.isdir(prompt_dir):
-        print("\nVí dụ object có mọi part trùng mask:")
+        print("\nExample objects whose parts all share one mask:")
         for key, paths, v in examples:
-            print(f"  {key}  (IoU nhỏ nhất {v:.3f})")
+            print(f"  {key}  (lowest IoU {v:.3f})")
             for p in paths:
                 sid = os.path.splitext(os.path.basename(p))[0]
                 fp = os.path.join(prompt_dir, sid + ".pkl")

@@ -43,16 +43,17 @@ class GraspDatasetBase(torch.utils.data.Dataset):
 
     def eval_view(self):
         """
-        Bản sao *nông* của dataset với augmentation tắt, dùng cho validation/test.
+        A *shallow* copy of the dataset with augmentation disabled, for validation/test.
 
-        Trước đây `train_network.py` đưa cùng một dataset (random_rotate/random_zoom bật) cho
-        cả train lẫn validate. Với `zoom ~ U(0.5, 1.0)` phép crop cắt tới một nửa khung hình,
-        mà `get_gtbb` không loại grasp rơi ra ngoài -- target thành rỗng và mẫu đó tự động
-        tính là fail. Chỉ số chọn checkpoint vì thế đo trên dữ liệu đã bị hỏng.
+        Previously `train_network.py` handed the same dataset (random_rotate/random_zoom on) to
+        both training and validation. With `zoom ~ U(0.5, 1.0)` the crop cuts away up to half
+        the frame, and `get_gtbb` does not drop grasps that fall outside -- the target ends up
+        empty and the sample automatically counts as a failure. The checkpoint-selection metric
+        was therefore measured on corrupted data.
 
-        Sao chép nông (không `deepcopy`) là cố ý: `grasp_files` và các bảng index phụ dùng
-        chung tham chiếu, nên không tốn thêm bộ nhớ lẫn thời gian glob lại 880k file, mà mỗi
-        DataLoader worker vẫn nhận đúng cờ augmentation của bản sao.
+        The shallow copy (not `deepcopy`) is deliberate: `grasp_files` and the auxiliary index
+        tables are shared by reference, so it costs no extra memory and no re-globbing of 880k
+        files, while each DataLoader worker still sees the copy's own augmentation flags.
         """
         view = copy.copy(self)
         view.random_rotate = False
@@ -78,11 +79,12 @@ class GraspDatasetBase(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self.random_rotate:
             rotations = [0, np.pi / 2, 2 * np.pi / 2, 3 * np.pi / 2]
-            # `float(...)` không thừa: phần tử đầu của `rotations` là *int* 0, nên khi nó rơi
-            # vào vị trí đầu batch, `default_collate` đi nhánh int và dựng tensor bằng
-            # `torch.tensor([0, 1.5707963267948966, ...])` -> ra float32, mất 8 chữ số của các
-            # góc còn lại. Với batch_size = 1 lỗi này không lộ ra; batch hoá validation thì
-            # `rot` mà validate dùng để dựng GT lệch khỏi `rot` mà loader đã dùng để xoay ảnh.
+            # The `float(...)` is not redundant: the first element of `rotations` is an *int*
+            # 0, so when it lands first in a batch `default_collate` takes the int branch and
+            # builds the tensor as `torch.tensor([0, 1.5707963267948966, ...])` -> float32,
+            # losing 8 digits of the other angles. At batch_size = 1 the bug is invisible; once
+            # validation is batched, the `rot` used to build the GT drifts from the `rot` the
+            # loader used to rotate the image.
             rot = float(random.choice(rotations))
         else:
             rot = 0.0

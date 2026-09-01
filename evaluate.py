@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def eval_extras(net, batch, device):
-    """Phần tử thứ 6 (prompt/part_mask) của Grasp-Anything++; xem train_network.py."""
+    """The 6th element (prompt/part_mask) of Grasp-Anything++; see train_network.py."""
     if len(batch) < 6 or not getattr(net, "accepts_extras", False):
         return {}
     extra = batch[5]
@@ -52,7 +52,7 @@ def parse_args():
         "--split-path",
         type=str,
         default=None,
-        help="Thư mục chứa seen.obj/unseen.obj (mặc định dò theo SPLIT_DIRS của loader)",
+        help="Directory holding seen.obj/unseen.obj (default: the loader's SPLIT_DIRS)",
     )
     parser.add_argument(
         "--use-depth", type=int, default=1, help="Use Depth image for evaluation (1/0)"
@@ -76,16 +76,17 @@ def parse_args():
         "--test-split",
         type=float,
         default=0.0,
-        help="Phải khớp --test-split của train_network.py để tái lập đúng lát cắt.",
+        help="Must match train_network.py's --test-split to reproduce the same slice.",
     )
     parser.add_argument(
         "--subset",
         type=str,
         default="val",
         choices=list(SUBSETS),
-        help="Lát cắt đem đánh giá. 'val' = hành vi cũ (mọi index sau --split), nhưng đó là "
-        "tập đã dùng chọn checkpoint nên số ra sẽ lạc quan. Dùng 'test' cho tập độc lập "
-        "(cần train với --test-split > 0), 'all' cho toàn bộ split seen/unseen.",
+        help="Which slice to evaluate. 'val' = the upstream behaviour (every index after "
+        "--split), but that is the set used to select the checkpoint, so the number will be "
+        "optimistic. Use 'test' for an independent set (requires training with --test-split "
+        "> 0), or 'all' for the entire seen/unseen split.",
     )
     parser.add_argument(
         "--ds-shuffle", action="store_true", default=False, help="Shuffle the dataset"
@@ -101,8 +102,8 @@ def parse_args():
         "--batch-size",
         type=int,
         default=1,
-        help="Batch size lúc evaluate. Forward chạy theo lô, nhưng post-process và IoU "
-        "vẫn được tính riêng từng ảnh để giữ nguyên metric.",
+        help="Evaluation batch size. The forward pass is batched, but post-processing and IoU "
+        "are still computed per image so the metric is unchanged.",
     )
 
     # Evaluation
@@ -142,8 +143,8 @@ def parse_args():
     parser.add_argument(
         "--shuffle-prompts",
         action="store_true",
-        help="ĐỐI CHỨNG: ghép mỗi ảnh với prompt của một object khác. Nếu accuracy gần như "
-        "không đổi thì model đang bỏ qua ngôn ngữ. Chỉ dùng được với grasp-anything-pp.",
+        help="COUNTERFACTUAL: pair every image with another object's prompt. If accuracy barely "
+        "moves, the model is ignoring the language. Only works with grasp-anything-pp.",
     )
 
     args = parser.parse_args()
@@ -178,7 +179,7 @@ if __name__ == "__main__":
         include_rgb=args.use_rgb,
         seen=args.seen,
     )
-    # Chỉ truyền khi có, vì các loader khác (cornell/jacquard/...) không nhận kwarg này.
+    # Only passed when set, because the other loaders (cornell/jacquard/...) reject this kwarg.
     if args.split_path:
         ds_kwargs["split_path"] = args.split_path
     test_dataset = Dataset(args.dataset_path, **ds_kwargs)
@@ -186,17 +187,18 @@ if __name__ == "__main__":
     if args.shuffle_prompts:
         if not hasattr(test_dataset, "shuffle_prompts"):
             raise SystemExit(
-                f"--shuffle-prompts chỉ có nghĩa với dataset có prompt; {args.dataset} không có."
+                f"--shuffle-prompts only makes sense for datasets with prompts; "
+                f"{args.dataset} has none."
             )
         test_dataset.shuffle_prompts(seed=args.random_seed)
         logging.warning(
-            "--shuffle-prompts: prompt đã bị hoán vị (seed %d). Con số dưới đây là ĐỐI CHỨNG "
-            "ÂM, không phải kết quả của model.",
+            "--shuffle-prompts: prompts have been permuted (seed %d). The numbers below are a "
+            "NEGATIVE CONTROL, not the model's result.",
             args.random_seed,
         )
 
-    # Dùng chung utils/data/index_split.py với train_network.py: hai file cắt index bằng đúng
-    # một hàm nên không thể lệch nhau nữa.
+    # Shares utils/data/index_split.py with train_network.py: both slice indices through the
+    # very same function, so they can no longer drift apart.
     splits = index_splits(
         test_dataset.length,
         train_frac=args.split,
@@ -207,16 +209,17 @@ if __name__ == "__main__":
     val_indices = select_subset(splits, args.subset)
     if not val_indices:
         raise SystemExit(
-            f"subset '{args.subset}' rỗng ({describe(splits)}). Với --subset test cần train "
-            "bằng --test-split > 0 và truyền lại đúng --split/--test-split/--ds-shuffle."
+            f"subset '{args.subset}' is empty ({describe(splits)}). --subset test requires "
+            "training with --test-split > 0 and passing back the same "
+            "--split/--test-split/--ds-shuffle."
         )
     val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
     logging.info(f"Index splits: {describe(splits)}")
     logging.info(f"Evaluating subset '{args.subset}': {len(val_indices)} samples")
     if args.subset == "val":
         logging.warning(
-            "subset='val' là tập đã dùng để chọn checkpoint trong train_network.py -- con số "
-            "thu được lạc quan, không phải kết quả trên tập độc lập."
+            "subset='val' is the set used to select the checkpoint in train_network.py -- the "
+            "resulting number is optimistic, not a result on an independent set."
         )
 
     test_data = torch.utils.data.DataLoader(
@@ -231,9 +234,9 @@ if __name__ == "__main__":
     for network in args.network:
         logging.info(f"\nEvaluating model {network}")
 
-        # load_network đọc cả checkpoint state_dict (mới) lẫn module đã pickle (cũ) và luôn
-        # trả về model ở .eval() -- bắt buộc vì model có dropout 0,1 và BatchNorm, mà cờ
-        # training được lưu kèm checkpoint.
+        # load_network reads both the state_dict checkpoints and the pickled modules, and
+        # always returns the model in .eval() -- required because the model has dropout 0.1 and
+        # BatchNorm, and the training flag is stored with the checkpoint.
         net = load_network(network, map_location=device)
 
         results = {"correct": 0, "failed": 0}
@@ -256,8 +259,9 @@ if __name__ == "__main__":
                 lossd = net.compute_loss(xc, yc, **eval_extras(net, batch, device))
                 pred = lossd["pred"]
 
-                # post_process_output dùng Gaussian filter 2D. Cắt từng sample trước khi
-                # gọi để filter không trộn chiều batch vào chiều không gian.
+                # post_process_output applies a 2-D gaussian filter. Slice per sample before
+                # calling it, so the filter does not mix the batch dimension into the spatial
+                # ones.
                 for i in range(batch_size):
                     sample_idx = int(didx[i])
                     sample_rot = float(rot[i])

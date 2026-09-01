@@ -1,43 +1,43 @@
 #!/usr/bin/env bash
 #
-# Tải dữ liệu Grasp-Anything++ (có cache) + train + eval theo protocol của paper LGD.
+# Download Grasp-Anything++ (cached) + train + eval following the LGD paper's protocol.
 #
-# CẤU HÌNH CỦA TA: **một GPU · 100.000 scene (~445k sample, 10% GA++) · 50 epoch.**
-# Ba con số này là lựa chọn về tài nguyên, không phải của paper -- ghi rõ ở đây và trong
-# config.txt của mỗi lần chạy để báo cáo không nhập nhằng.
+# OUR CONFIGURATION: **one GPU, 100,000 scenes (~445k samples, 10% of GA++), 50 epochs.**
+# Those three numbers are resource choices, not the paper's -- stated here and in each run's
+# config.txt so the report stays unambiguous.
 #
-# Paper (Vuong et al., CVPR 2024) nêu rõ những gì:
-#   * train/eval trên GA++ đầy đủ (4,41 triệu sample) -- ta chạy trên 10%
-#   * split Base/New = 70/30 category theo tần suất  (§5.1)  -- giữ nguyên
-#   * success khi IoU >= 0.25 VÀ lệch góc <= 30 độ, báo cáo Seen / Unseen / harmonic mean H
-#     -- giữ nguyên
-#   * 100 epoch (Fig 6) -- ta chạy 50
-# Paper KHÔNG nêu trong bản chính: batch size, optimizer, learning rate -- nằm ở Supplementary
-# mà ta không có. Những giá trị đó ở dưới là lựa chọn của ta.
+# What the paper (Vuong et al., CVPR 2024) states:
+#   * train/eval on the full GA++ (4.41M samples) -- we run on 10%
+#   * Base/New split = 70/30 of categories by frequency (Sec. 5.1) -- kept
+#   * success when IoU >= 0.25 AND angular error <= 30 degrees, reporting
+#     Seen / Unseen / harmonic mean H -- kept
+#   * 100 epochs (Fig. 6) -- we run 50
+# What the paper does NOT state in the main text: batch size, optimizer, learning rate -- those
+# are in a Supplementary we do not have. The values below are our own choices.
 #
-# Lưu ý về "epoch": repo này định nghĩa epoch = BATCHES_PER_EPOCH batch, không phải một lượt
-# qua hết dữ liệu. 50 x 2000 x 64 = 6,4 triệu lượt sample = ~14 lượt qua 445k sample của
-# subset -- nghĩa là subset 100k scene được nhìn *nhiều lần*, khác hẳn với 100 epoch trên GA++
-# đầy đủ (2,9 lượt). Số phải ghi trong báo cáo là ngân sách 6,4M lượt sample, và nó phải giống
-# hệt nhau giữa mọi arm ablation.
+# A note on "epoch": this repo defines an epoch as BATCHES_PER_EPOCH batches, not one pass over
+# the data. 50 x 2000 x 64 = 6.4M sample draws = ~14 passes over the subset's 445k samples --
+# i.e. the 100k-scene subset is seen *several times*, quite unlike 100 epochs on the full GA++
+# (2.9 passes). The number to report is the 6.4M-sample-draw budget, and it must be identical
+# across every ablation arm.
 #
-# Một GPU: train_network.py không có DataParallel/DDP nên mỗi run dùng đúng một GPU. Chọn GPU
-# nào thì đặt biến GPU (script tự export CUDA_VISIBLE_DEVICES). Bảng ablation chạy tuần tự
-# trên cùng một GPU: script/run_ablation.sh.
+# One GPU: train_network.py has no DataParallel/DDP, so each run uses exactly one GPU. Pick it
+# with the GPU variable (the script exports CUDA_VISIBLE_DEVICES itself). The ablation table
+# runs sequentially on the same GPU: script/run_ablation.sh.
 #
-# Mọi tham số override được bằng biến môi trường:
+# Every parameter can be overridden through the environment:
 #   SCENES=200000 NUM_WORKERS=24 bash script/run_paper_setting.sh
 #   GPU=1 bash script/run_paper_setting.sh
 #
-# Các bước đều có cache: chạy lại sẽ bỏ qua phần đã xong.
+# Every step is cached: re-running skips whatever is already done.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PYTHON=${PYTHON:-python3}
 
-# Một GPU cho cả run. train_network.py/evaluate.py lấy `cuda` (tức cuda:0) từ
-# hardware/device.py, nên chọn GPU vật lý bằng CUDA_VISIBLE_DEVICES chứ không phải bằng cờ.
+# One GPU for the whole run. train_network.py/evaluate.py take `cuda` (i.e. cuda:0) from
+# hardware/device.py, so the physical GPU is selected with CUDA_VISIBLE_DEVICES, not a flag.
 if [ -n "${GPU:-}" ]; then
     export CUDA_VISIBLE_DEVICES="$GPU"
 fi
@@ -46,45 +46,45 @@ DATA_DIR=${DATA_DIR:-data/grasp-anything-pp-full}
 SPLIT_DIR=${SPLIT_DIR:-split/grasp-anything-pp}
 ZIPS_DIR=${ZIPS_DIR:-$DATA_DIR/_archives}
 
-# Tổng số scene của GA++, chỉ dùng để in "x / tổng". Đừng viết 994_860: bash printf báo
-# "invalid number" và awk đọc "100_000" thành 100 -- ước tính đĩa sẽ ra 0.
+# GA++'s total scene count, used only to print "x / total". Do not write 994_860: bash printf
+# reports "invalid number" and awk reads "100_000" as 100 -- the disk estimate comes out 0.
 TOTAL_SCENES=994860
-SCENES=${SCENES:-100000}              # mặc định: subset 10% (~445k sample)
-PACK_MASKS=${PACK_MASKS:-1}           # 21 KB/mask thay vì 173 KB, không mất mát
-KEEP_ZIPS=${KEEP_ZIPS:-1}             # giữ zip để lần sau đổi SCENES không phải tải lại
+SCENES=${SCENES:-100000}              # default: a 10% subset (~445k samples)
+PACK_MASKS=${PACK_MASKS:-1}           # 21 KB/mask instead of 173 KB, lossless
+KEEP_ZIPS=${KEEP_ZIPS:-1}             # keep the zips so changing SCENES needs no re-download
 
 NPROC=$(nproc)
 NUM_WORKERS=${NUM_WORKERS:-$(( NPROC / 2 > 32 ? 32 : (NPROC / 2 < 2 ? 2 : NPROC / 2) ))}
 
-NETWORK=${NETWORK:-grconvnet3_align}
-EPOCHS=${EPOCHS:-50}                  # 50 x 2000 x 64 = 6,4M lượt sample
+NETWORK=${NETWORK:-stag}
+EPOCHS=${EPOCHS:-50}                  # 50 x 2000 x 64 = 6.4M sample draws
 BATCHES_PER_EPOCH=${BATCHES_PER_EPOCH:-2000}
 BATCH_SIZE=${BATCH_SIZE:-64}
 INPUT_SIZE=${INPUT_SIZE:-224}
-VAL_SPLIT=${VAL_SPLIT:-0.998}         # tỉ lệ dev set dùng để train; phần còn lại là val
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}  # validate đã batch hoá (bản cũ cố định 1)
-AMP=${AMP:-auto}                      # auto = bf16 nếu GPU hỗ trợ. off = fp32 như các run cũ
+VAL_SPLIT=${VAL_SPLIT:-0.998}         # fraction of the dev set used for training; rest is val
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}  # validation is batched (upstream hard-codes 1)
+AMP=${AMP:-auto}                      # auto = bf16 if the GPU supports it. off = pure fp32
 CHANNELS_LAST=${CHANNELS_LAST:-auto}
 TOKENIZE_IN_LOADER=${TOKENIZE_IN_LOADER:-1}
 LR=${LR:-1e-3}
 LR_SCHEDULE=${LR_SCHEDULE:-cosine}
 USE_TEXT=${USE_TEXT:-1}
 W_ALIGN=${W_ALIGN:-0.3}
-ALIGN_MODE=${ALIGN_MODE:-soft}        # soft = V2 (softmax theo token); hard = V1 (max)
-REGION_TEXT=${REGION_TEXT:-1}         # đưa R_T vào decoder
-FUSION=${FUSION:-residual}            # residual = V2; gate = V1
+ALIGN_MODE=${ALIGN_MODE:-soft}        # soft = softmax over tokens; hard = argmax
+REGION_TEXT=${REGION_TEXT:-1}         # feed R_T to the decoder
+FUSION=${FUSION:-residual}            # residual = F + phi(...); gate = F * (1 + lambda*A_T)
 ALIGN_STAGE=${ALIGN_STAGE:-bottleneck}
 WARMUP_EPOCHS=${WARMUP_EPOCHS:-3}
-DIAG_INTERVAL=${DIAG_INTERVAL:-500}   # step giữa hai lần ghi fusion/token/gradient
-PROBE_SAMPLES=${PROBE_SAMPLES:-8}     # probe set cố định để vẽ hình qua các epoch
+DIAG_INTERVAL=${DIAG_INTERVAL:-500}   # steps between fusion/token/gradient logs
+PROBE_SAMPLES=${PROBE_SAMPLES:-8}     # fixed probe set redrawn across epochs
 COUNTERFACTUAL_EVERY=${COUNTERFACTUAL_EVERY:-5}
 DESCRIPTION=${DESCRIPTION:-ga-pp-paper}
 LOGDIR=${LOGDIR:-logs/}
 
 RESULTS_DIR=${RESULTS_DIR:-results}
-N_FIGURES=${N_FIGURES:-4}             # số sample vẽ alignment cho mỗi split
-COPY_CHECKPOINT=${COPY_CHECKPOINT:-0} # chép cả checkpoint (~9 MB) vào results/
-AUDIT_SAMPLES=${AUDIT_SAMPLES:-500}   # số sample cho đối chứng prompt-sai
+N_FIGURES=${N_FIGURES:-4}             # samples per split to draw alignment figures for
+COPY_CHECKPOINT=${COPY_CHECKPOINT:-0} # also copy the checkpoint (~9 MB) into results/
+AUDIT_SAMPLES=${AUDIT_SAMPLES:-500}   # samples for the wrong-prompt counterfactual
 
 SKIP_BUILD=${SKIP_BUILD:-0}
 SKIP_SPLIT=${SKIP_SPLIT:-0}
@@ -97,68 +97,69 @@ SKIP_EXPORT=${SKIP_EXPORT:-0}
 RUN_STAMP=$(date +%y%m%d_%H%M)
 RUN_RESULTS="$RESULTS_DIR/${RUN_STAMP}_${DESCRIPTION}"
 
-# --------------------------------------------------------------- kế hoạch ---
+# ------------------------------------------------------------------- plan ---
 SAMPLES=$(awk "BEGIN{printf \"%d\", $SCENES * 4.436}")
 if [ "$PACK_MASKS" = "1" ]; then MASK_KB=24; else MASK_KB=176; fi
-# .pt và .pkl mỗi file chiếm tối thiểu một block 4 KB, cộng vào cho sát thực tế.
+# Each .pt and .pkl file takes at least one 4 KB block; added in for a realistic estimate.
 NEED_GB=$(awk "BEGIN{printf \"%d\", ($SAMPLES*($MASK_KB+8) + $SCENES*69)/1048576 + 1}")
 AVAIL_GB=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
 
 cat <<EOF
-== kế hoạch ==
-  scene            : $(printf "%'d" "$SCENES") / $(printf "%'d" $TOTAL_SCENES)
-  sample (ước tính): $(printf "%'d" "$SAMPLES")
+== plan ==
+  scenes           : $(printf "%'d" "$SCENES") / $(printf "%'d" $TOTAL_SCENES)
+  samples (est.)   : $(printf "%'d" "$SAMPLES")
   pack-masks       : $PACK_MASKS
-  đĩa cần          : ~${NEED_GB} GB (chưa kể ~76 GB archive nếu KEEP_ZIPS=1)
-  đĩa trống        : ${AVAIL_GB} GB
-  workers          : $NUM_WORKERS (máy có $NPROC core)
-  ngân sách train  : $EPOCHS x $BATCHES_PER_EPOCH x $BATCH_SIZE = $(awk "BEGIN{printf \"%'d\", $EPOCHS*$BATCHES_PER_EPOCH*$BATCH_SIZE}") lượt sample
+  disk needed      : ~${NEED_GB} GB (excluding ~76 GB of archives if KEEP_ZIPS=1)
+  disk free        : ${AVAIL_GB} GB
+  workers          : $NUM_WORKERS (machine has $NPROC cores)
+  training budget  : $EPOCHS x $BATCHES_PER_EPOCH x $BATCH_SIZE = $(awk "BEGIN{printf \"%'d\", $EPOCHS*$BATCHES_PER_EPOCH*$BATCH_SIZE}") sample draws
 EOF
 
 if [ "$AVAIL_GB" -lt "$NEED_GB" ]; then
     FIT=$(awk "BEGIN{printf \"%d\", ($AVAIL_GB-20)*1048576/(4.436*($MASK_KB+8)+69)}")
     echo
-    echo "Không đủ đĩa. Với ${AVAIL_GB} GB trống thì tối đa khoảng SCENES=${FIT}." >&2
-    echo "Chạy lại:  SCENES=${FIT} bash $0" >&2
+    echo "Not enough disk. With ${AVAIL_GB} GB free the maximum is about SCENES=${FIT}." >&2
+    echo "Re-run:  SCENES=${FIT} bash $0" >&2
     exit 1
 fi
 echo
 
 # ------------------------------------------------------------------ build ---
 if [ "$SKIP_BUILD" = "1" ]; then
-    echo "== 1/7  bỏ qua build (SKIP_BUILD=1) =="
+    echo "== 1/7  skipping build (SKIP_BUILD=1) =="
 else
-    echo "== 1/7  dựng dataset =="
+    echo "== 1/7  building dataset =="
     BUILD_ARGS=(--out "$DATA_DIR" --zips-dir "$ZIPS_DIR" --scenes "$SCENES" --images-from-zip)
     [ "$PACK_MASKS" = "1" ] && BUILD_ARGS+=(--pack-masks)
     [ "$KEEP_ZIPS" = "1" ] && BUILD_ARGS+=(--keep-zips)
-    # Script tự bỏ qua zip đã tải và file đã trích, nên chạy lại là rẻ.
+    # The script skips already-downloaded zips and already-extracted files, so re-running is cheap.
     "$PYTHON" script/build_ga_pp_subset.py "${BUILD_ARGS[@]}"
 fi
 
 # ------------------------------------------------------------------ split ---
 if [ "$SKIP_SPLIT" = "1" ]; then
     echo
-    echo "== 2/7  bỏ qua split (SKIP_SPLIT=1) =="
+    echo "== 2/7  skipping split (SKIP_SPLIT=1) =="
 elif [ -f "$SPLIT_DIR/seen.obj" ] && [ -f "$SPLIT_DIR/unseen.obj" ]; then
     echo
-    echo "== 2/7  split đã có ở $SPLIT_DIR, bỏ qua =="
+    echo "== 2/7  split already present in $SPLIT_DIR, skipping =="
 else
     echo
-    echo "== 2/7  dựng split Base/New 70/30 =="
+    echo "== 2/7  building the 70/30 Base/New split =="
     "$PYTHON" split/build_grasp_anything_pp.py --data-dir "$DATA_DIR" --out-dir "$SPLIT_DIR"
 fi
 
-# ------------------------------------------------------------- kiểm dữ liệu ---
-# Chạy một lần trước khi tốn GPU: part_mask có thật ở mức part không, foreground bao nhiêu,
-# prompt còn mấy token sau khi lọc. Nếu mask hoá ra ở mức object thì L_align không dạy được
-# grounding part-level và cả bảng ablation sẽ ra Δ nhỏ -- biết trước vẫn hơn.
+# ------------------------------------------------------------- data check ---
+# Run once before spending GPU time: is part_mask really at part level, how much foreground is
+# there, how many tokens survive filtering in each prompt. If the masks turn out to be at object
+# level, L_align cannot teach part-level grounding and the whole ablation table will show small
+# deltas -- better to know beforehand.
 if [ "$SKIP_CHECK" = "1" ]; then
     echo
-    echo "== 3/7  bỏ qua kiểm dữ liệu (SKIP_CHECK=1) =="
+    echo "== 3/7  skipping data check (SKIP_CHECK=1) =="
 else
     echo
-    echo "== 3/7  kiểm dữ liệu =="
+    echo "== 3/7  data check =="
     mkdir -p "$RUN_RESULTS"
     "$PYTHON" script/check_dataset.py \
         --data-dir "$DATA_DIR" --split-path "$SPLIT_DIR" \
@@ -169,12 +170,12 @@ fi
 # ------------------------------------------------------------------ train ---
 if [ "$SKIP_TRAIN" = "1" ]; then
     echo
-    echo "== 4/7  bỏ qua train (SKIP_TRAIN=1) =="
+    echo "== 4/7  skipping training (SKIP_TRAIN=1) =="
 else
     echo
     echo "== 4/7  train  (log: $RUN_RESULTS/train.log) =="
     mkdir -p "$RUN_RESULTS"
-    # Ghi lại đúng cấu hình đã dùng -- báo cáo cần con số thật chứ không phải trí nhớ.
+    # Record the exact configuration used -- the report needs real numbers, not recollection.
     printf "%s\n" \
         "data_dir=$DATA_DIR" "split_dir=$SPLIT_DIR" "scenes=$SCENES" \
         "pack_masks=$PACK_MASKS" "network=$NETWORK" "epochs=$EPOCHS" \
@@ -219,29 +220,29 @@ fi
 # ------------------------------------------------------------------- eval ---
 if [ "$SKIP_EVAL" = "1" ]; then
     echo
-    echo "== 5/7  bỏ qua eval (SKIP_EVAL=1) =="
+    echo "== 5/7  skipping eval (SKIP_EVAL=1) =="
     exit 0
 fi
 mkdir -p "$RUN_RESULTS"
 
-# -type d: $LOGDIR còn chứa cả file .log của run_ablation.sh, `ls -d` sẽ khớp nhầm.
+# -type d: $LOGDIR also holds run_ablation.sh .log files, which `ls -d` would match wrongly.
 RUN_DIR=$(find "$LOGDIR" -maxdepth 1 -type d -name "*${DESCRIPTION}*" 2>/dev/null | sort | tail -1)
 if [ -z "$RUN_DIR" ]; then
-    echo "Không thấy thư mục log nào khớp *$DESCRIPTION* trong $LOGDIR" >&2
+    echo "No log directory matching *$DESCRIPTION* found in $LOGDIR" >&2
     exit 1
 fi
-# Sắp theo tên file thôi -- đường dẫn đầy đủ có underscore nên `sort -t_` trên nó sẽ lệch cột.
+# Sort on the filename only -- the full path contains underscores, so `sort -t_` on it shifts columns.
 BEST=$(cd "$RUN_DIR" && ls | grep '^epoch_' | sort -t_ -k4 -g | tail -1 || true)
 CHECKPOINT=${BEST:+$RUN_DIR/$BEST}
 if [ -z "$CHECKPOINT" ]; then
-    echo "Không thấy checkpoint trong $RUN_DIR" >&2
+    echo "No checkpoint found in $RUN_DIR" >&2
     exit 1
 fi
 
 echo
 echo "== 5/7  eval: $CHECKPOINT =="
 
-run_eval() {  # run_eval <seen 1|0> <split> <tên file log>
+run_eval() {  # run_eval <seen 1|0> <split> <log filename>
     "$PYTHON" evaluate.py \
         --dataset grasp-anything-pp \
         --dataset-path "$DATA_DIR" \
@@ -253,9 +254,9 @@ run_eval() {  # run_eval <seen 1|0> <split> <tên file log>
     | tee "$RUN_RESULTS/$3" /dev/stderr | awk '/IOU Results/ { print $NF }' | tail -1
 }
 
-echo "-- seen (Base), đúng phần giữ lại lúc train --"
+echo "-- seen (Base), exactly the part held out during training --"
 SEEN=$(run_eval 1 "$VAL_SPLIT" eval_seen.log)
-echo "-- unseen (New), toàn bộ --"
+echo "-- unseen (New), all of it --"
 UNSEEN=$(run_eval 0 0.0 eval_unseen.log)
 
 "$PYTHON" - "$SEEN" "$UNSEEN" "$CHECKPOINT" <<'PY'
@@ -264,7 +265,7 @@ import sys
 seen, unseen, ckpt = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
 h = 0.0 if seen + unseen == 0 else 2 * seen * unseen / (seen + unseen)
 print()
-# Dòng máy đọc được, để script gộp bảng ablation lấy số (xem run_ablation.sh).
+# A machine-readable line, so the ablation table script can pick up the numbers (see run_ablation.sh).
 print(f"RESULT\t{seen:.4f}\t{unseen:.4f}\t{h:.4f}")
 print(f"checkpoint: {ckpt}")
 print(f"{'':24} {'Seen':>7} {'Unseen':>7} {'H':>7}")
@@ -273,19 +274,20 @@ for name, s, u, hh in [("GR-ConvNet + CLIP †", 0.37, 0.18, 0.24),
                        ("CLIP-Fusion †", 0.40, 0.29, 0.33),
                        ("LGD †", 0.48, 0.42, 0.45)]:
     print(f"{name:24} {s:7.2f} {u:7.2f} {hh:7.2f}")
-print("\n† Table 2 của paper (GA++ đầy đủ, split gốc theo nhãn LVIS). Split ở đây là bản tái")
-print("  tạo protocol nên chỉ dùng làm mốc tham chiếu.")
+print("\n† Table 2 of the paper (full GA++, original split over LVIS labels). The split here is")
+print("  a reproduction of the protocol, so these are reference points only.")
 PY
 
 # ------------------------------------------------------------------ audit ---
-# Đối chứng bắt buộc của một method language-driven: ghép ảnh với prompt của object khác. Nếu
-# accuracy không đổi thì bảng Seen/Unseen ở trên không chứng minh được ngôn ngữ có tác dụng.
+# The mandatory counterfactual for a language-driven method: pair images with another object's
+# prompt. If accuracy does not move, the Seen/Unseen table above proves nothing about the
+# language mattering.
 if [ "$SKIP_AUDIT" = "1" ] || [ "$USE_TEXT" = "0" ]; then
     echo
-    echo "== 6/7  bỏ qua audit =="
+    echo "== 6/7  skipping audit =="
 else
     echo
-    echo "== 6/7  đối chứng prompt sai ($AUDIT_SAMPLES sample/split) =="
+    echo "== 6/7  wrong-prompt counterfactual ($AUDIT_SAMPLES samples/split) =="
     "$PYTHON" script/audit_text_reliance.py \
         --checkpoint "$CHECKPOINT" \
         --dataset-path "$DATA_DIR" \
@@ -299,12 +301,12 @@ fi
 
 if [ "$SKIP_EXPORT" = "1" ]; then
     echo
-    echo "== 7/7  bỏ qua export (SKIP_EXPORT=1) =="
+    echo "== 7/7  skipping export (SKIP_EXPORT=1) =="
     exit 0
 fi
 
 echo
-echo "== 7/7  gom kết quả vào $RUN_RESULTS =="
+echo "== 7/7  collecting results into $RUN_RESULTS =="
 EXPORT_ARGS=(
     --checkpoint "$CHECKPOINT"
     --dataset-path "$DATA_DIR"
@@ -319,4 +321,4 @@ EXPORT_ARGS=(
 "$PYTHON" script/export_results.py "${EXPORT_ARGS[@]}"
 
 echo
-echo "Xong. Kết quả ở $RUN_RESULTS"
+echo "Done. Results in $RUN_RESULTS"
