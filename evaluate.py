@@ -97,6 +97,13 @@ def parse_args():
         help="Shift the start point of the dataset to use a different test/train split",
     )
     parser.add_argument("--num-workers", type=int, default=8, help="Dataset workers")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size lúc evaluate. Forward chạy theo lô, nhưng post-process và IoU "
+        "vẫn được tính riêng từng ảnh để giữ nguyên metric.",
+    )
 
     # Evaluation
     parser.add_argument(
@@ -147,6 +154,8 @@ def parse_args():
         )
     if args.jacquard_output and args.augment:
         raise ValueError("--jacquard-output can not be used with data augmentation.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
 
     return args
 
@@ -211,8 +220,12 @@ if __name__ == "__main__":
         )
 
     test_data = torch.utils.data.DataLoader(
-        test_dataset, batch_size=1, num_workers=args.num_workers, sampler=val_sampler
+        test_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        sampler=val_sampler,
     )
+    logging.info(f"Evaluation batch size: {args.batch_size}")
     logging.info("Done")
 
     for network in args.network:
@@ -231,57 +244,71 @@ if __name__ == "__main__":
                 pass
 
         start_time = time.time()
+        n_samples = 0
 
         with torch.no_grad():
             for idx, batch in enumerate(test_data):
                 x, y, didx, rot, zoom = batch[:5]
+                batch_size = x.shape[0]
+                n_samples += batch_size
                 xc = x.to(device)
                 yc = [yi.to(device) for yi in y]
                 lossd = net.compute_loss(xc, yc, **eval_extras(net, batch, device))
+                pred = lossd["pred"]
 
-                q_img, ang_img, width_img = post_process_output(
-                    lossd["pred"]["pos"],
-                    lossd["pred"]["cos"],
-                    lossd["pred"]["sin"],
-                    lossd["pred"]["width"],
-                )
-
-                if args.iou_eval:
-                    s = evaluation.calculate_iou_match(
-                        q_img,
-                        ang_img,
-                        test_data.dataset.get_gtbb(didx, rot, zoom),
-                        no_grasps=args.n_grasps,
-                        grasp_width=width_img,
-                        threshold=args.iou_threshold,
-                    )
-                    if s:
-                        results["correct"] += 1
-                    else:
-                        results["failed"] += 1
-
-                if args.jacquard_output:
-                    grasps = grasp.detect_grasps(
-                        q_img, ang_img, width_img=width_img, no_grasps=1
-                    )
-                    with open(jo_fn, "a") as f:
-                        for g in grasps:
-                            f.write(test_data.dataset.get_jname(didx) + "\n")
-                            f.write(g.to_jacquard(scale=1024 / 300) + "\n")
-
-                if args.vis:
-                    save_results(
-                        rgb_img=test_data.dataset.get_rgb(
-                            didx, rot, zoom, normalise=False
-                        ),
-                        depth_img=test_data.dataset.get_depth(didx, rot, zoom),
-                        grasp_q_img=q_img,
-                        grasp_angle_img=ang_img,
-                        no_grasps=args.n_grasps,
-                        grasp_width_img=width_img,
+                # post_process_output dùng Gaussian filter 2D. Cắt từng sample trước khi
+                # gọi để filter không trộn chiều batch vào chiều không gian.
+                for i in range(batch_size):
+                    sample_idx = int(didx[i])
+                    sample_rot = float(rot[i])
+                    sample_zoom = float(zoom[i])
+                    q_img, ang_img, width_img = post_process_output(
+                        pred["pos"][i : i + 1].float(),
+                        pred["cos"][i : i + 1].float(),
+                        pred["sin"][i : i + 1].float(),
+                        pred["width"][i : i + 1].float(),
                     )
 
-        avg_time = (time.time() - start_time) / len(test_data)
+                    if args.iou_eval:
+                        s = evaluation.calculate_iou_match(
+                            q_img,
+                            ang_img,
+                            test_data.dataset.get_gtbb(
+                                sample_idx, sample_rot, sample_zoom
+                            ),
+                            no_grasps=args.n_grasps,
+                            grasp_width=width_img,
+                            threshold=args.iou_threshold,
+                        )
+                        if s:
+                            results["correct"] += 1
+                        else:
+                            results["failed"] += 1
+
+                    if args.jacquard_output:
+                        grasps = grasp.detect_grasps(
+                            q_img, ang_img, width_img=width_img, no_grasps=1
+                        )
+                        with open(jo_fn, "a") as f:
+                            for g in grasps:
+                                f.write(test_data.dataset.get_jname(sample_idx) + "\n")
+                                f.write(g.to_jacquard(scale=1024 / 300) + "\n")
+
+                    if args.vis:
+                        save_results(
+                            rgb_img=test_data.dataset.get_rgb(
+                                sample_idx, sample_rot, sample_zoom, normalise=False
+                            ),
+                            depth_img=test_data.dataset.get_depth(
+                                sample_idx, sample_rot, sample_zoom
+                            ),
+                            grasp_q_img=q_img,
+                            grasp_angle_img=ang_img,
+                            no_grasps=args.n_grasps,
+                            grasp_width_img=width_img,
+                        )
+
+        avg_time = (time.time() - start_time) / max(1, n_samples)
         logging.info(f"Average evaluation time per image: {avg_time * 1000}ms")
 
         if args.iou_eval:
