@@ -15,13 +15,13 @@
 #   * L_TOKEN (Update 3), chỉ bật ở RUN=C.
 #   * WARM START từ weights/model_grasp_anything (GR-ConvNet3 đã train trên GA đầy đủ, cùng
 #     kiến trúc, RGB 3 kênh, 115/115 tensor backbone khớp).
-#   * EPOCHS=50 thay vì 100 -- xem phần "vì sao 50" bên dưới.
+#   * EPOCHS=40 thay vì 100 -- xem phần "vì sao 40" bên dưới.
 #   * Chọn checkpoint từ checkpoints.jsonl (có iou đầy đủ chữ số) thay vì từ tên file đã làm
 #     tròn 2 chữ số.
 #   * Validation KHÔNG augmentation (mặc định mới của train_network.py).
 #
 # ---------------------------------------------------------------------------
-# VÌ SAO 50 EPOCH
+# VÌ SAO 40 EPOCH
 #
 # Từ đường cong validation của run 260830 (98 epoch, đọc bằng tensorboard events):
 #
@@ -32,8 +32,17 @@
 #     ep80-97  độ dốc +0,019 pp/epoch
 #     nhiễu val IoU trên plateau: std = 1,00 pp
 #
-# Từ epoch ~25 trở đi độ dốc nhỏ hơn nhiễu một bậc; 58 epoch cuối không mua được gì đo được.
-# Warm start còn bỏ qua phần lớn giai đoạn dốc đầu. 50 là dư dả.
+# Từ epoch ~25 trở đi độ dốc nhỏ hơn nhiễu một bậc; 73 epoch cuối không mua được gì đo được.
+# Và đó là run KHÔNG warm start: phần dốc ep0-19 chủ yếu là học hình học grasp cơ bản, thứ
+# mà --init-from đã có sẵn. 40 nằm dư dả sau mốc hội tụ.
+#
+# KHÔNG mở rộng được sau khi chạy xong: cosine T_max = EPOCHS và code không có resume. Nếu
+# 10 epoch cuối vẫn còn dốc (|slope| x 10 > 2 x std -- script in sẵn mean/std của 10 epoch
+# cuối ở stage PICK_CHECKPOINT) thì phải chạy lại với EPOCHS lớn hơn, không vá được.
+#
+# 40 cho ba run so sánh A/B/C. Nếu sau đó cần MỘT run để báo cáo thì 60 (max val IoU của
+# run cũ trong 60 epoch đầu là 0,3284 so với 0,3313 của cả 98 epoch -- đã bão hoà).
+# Đừng đổi EPOCHS giữa A, B, C: khác ngân sách thì không so được với nhau.
 #
 # LƯU Ý khi đọc kết quả: max val IoU trong 50 epoch đầu của run cũ là 0,3165 còn của cả 98
 # epoch là 0,3313. Chênh lệch đó gần như hoàn toàn là "max của nhiều lần rút thăm nhiễu",
@@ -46,6 +55,44 @@
 # learning rate chưa kịp anneal và kết quả sẽ tệ hơn hẳn chạy đủ lịch 50.
 #
 # ---------------------------------------------------------------------------
+# ĐỔI SỐ SCENE (vd 100k thay vì 200k)
+#
+# Builder giữ 1 scene trong mỗi round(994.860 / SCENES):
+#     SCENES=200000 -> 1/5  -> ~198.972 scene -> ~882.600 sample   (~41 GB)
+#     SCENES=100000 -> 1/10 ->  ~99.486 scene -> ~441.300 sample   (~21 GB)
+#
+# Dựng dataset 100k (một lần, KHÔNG dùng script này):
+#     SCENES=100000 DATA_DIR=$PROJECT/data/grasp-anything-pp-100k \
+#     SKIP_TRAIN=1 SKIP_EVAL=1 bash script/run_paper_setting.sh
+#
+# Rồi chạy:
+#     SCENES=100000 \
+#     DATA_DIR=$PROJECT/data/grasp-anything-pp-100k \
+#     SPLIT_DIR=$PROJECT/data/grasp-anything-pp-100k-split-v2 \
+#     RUN=B bash script/h200-run-ga-pp-200k-v2.sh
+#
+# Cái gì KHÔNG đổi:
+#   * EPOCHS, BATCHES_PER_EPOCH, BATCH_SIZE, LR, NUM_WORKERS. Ở repo này một "epoch" là
+#     BATCHES_PER_EPOCH batch, KHÔNG phải một lượt qua hết dữ liệu -- nên **giảm dữ liệu
+#     không làm giảm thời gian train**. 40 epoch vẫn là 5,12 triệu lượt sample, vẫn ~2,8 giờ.
+#     Giữ nguyên để ba run A/B/C và hai kích thước dataset còn so sánh được với nhau.
+#   * Thứ thay đổi là số lượt quét qua dữ liệu, tính trên tập seen của split stratified
+#     (~70% dữ liệu): 8,3 lượt (200k) -> 16,6 lượt (100k).
+#
+# Cái gì tự đổi theo: VAL_SPLIT và EVAL_UNSEEN_SPLIT (mặc định `auto`, tính từ số sample
+# thật của split để đạt VAL_TARGET / EVAL_UNSEEN_TARGET mẫu). Đừng hardcode chúng.
+#
+# Cái gì phải theo dõi thêm: overfitting. Run 260830 chạy 7,3 lượt và train ≈ val trên mọi
+# thành phần (khoảng cách ~2%), tức underfitting. Ở 14,5 lượt thì khoảng cách đó có thể mở
+# ra. Log đã in train và val riêng cho từng thành phần loss -- nếu khoảng cách mở ra trước
+# epoch 40, đó là một *phát hiện* (model cuối cùng cũng bị ép về dung lượng), không phải sự cố.
+#
+# Có nên dùng 100k không: hợp lý cho ba run chẩn đoán. Nút thắt đo được ở run trước là thiết
+# kế loss và chất lượng nhãn, không phải lượng dữ liệu -- model đang underfit chứ không thiếu
+# dữ liệu. Cái tiết kiệm được là ~20 GB đĩa và một nửa thời gian build/precompute, KHÔNG phải
+# thời gian GPU.
+#
+# ---------------------------------------------------------------------------
 # CÁCH DÙNG
 #
 #     RUN=A bash script/h200-run-ga-pp-200k-v2.sh     # baseline no-text
@@ -56,7 +103,7 @@
 # cũng vô nghĩa -- dừng lại và đổi nguồn nhãn thay vì chạy tiếp.
 #
 # Ước tính thời gian: run cũ đạt 504 sample/s (GPU-bound, loader dư sức ở 16 worker), tức
-# 4,25 phút/epoch. 50 epoch ≈ 3,5 giờ mỗi run.
+# 4,25 phút/epoch. 40 epoch ≈ 2,8 giờ mỗi run; ba run ≈ 8,5 giờ.
 
 set -euo pipefail
 
@@ -86,11 +133,18 @@ INIT_FROM=${INIT_FROM:-weights/model_grasp_anything}
 
 # ------------------------------------------------------------ cấu hình chạy --
 RUN=${RUN:-C}
-EPOCHS=${EPOCHS:-50}
+EPOCHS=${EPOCHS:-40}
 BATCHES_PER_EPOCH=${BATCHES_PER_EPOCH:-2000}
 BATCH_SIZE=${BATCH_SIZE:-64}
 INPUT_SIZE=${INPUT_SIZE:-224}
-VAL_SPLIT=${VAL_SPLIT:-0.998}
+# VAL_SPLIT / EVAL_UNSEEN_SPLIT: `auto` = tính từ số sample thật sau khi dựng split, để đạt
+# đúng VAL_TARGET / EVAL_UNSEEN_TARGET mẫu. Hardcode 0.998 chỉ đúng cho split CŨ (unseen 956
+# mẫu, seen 881k); với split stratified và/hoặc SCENES khác thì nó sai hẳn -- xem ghi chú
+# "ĐỔI SỐ SCENE" ở đầu file.
+VAL_SPLIT=${VAL_SPLIT:-auto}
+EVAL_UNSEEN_SPLIT=${EVAL_UNSEEN_SPLIT:-auto}
+VAL_TARGET=${VAL_TARGET:-2000}
+EVAL_UNSEEN_TARGET=${EVAL_UNSEEN_TARGET:-3000}
 LR=${LR:-0.001}
 LR_SCHEDULE=${LR_SCHEDULE:-cosine}
 WARMUP_EPOCHS=${WARMUP_EPOCHS:-3}
@@ -156,6 +210,28 @@ else
 fi
 cp -f "$SPLIT_DIR/split_stats.json" "$RUN_RESULTS/" 2>/dev/null || true
 
+# Hai tỉ lệ dưới đây phụ thuộc kích thước tập, mà kích thước lại phụ thuộc SCENES và cách
+# chia split. Tính từ số sample thật thay vì hardcode:
+#   * VAL_SPLIT quá cao -> tập validation vài trăm mẫu, sai số ±4pp, chọn checkpoint bằng nhiễu.
+#   * EVAL_UNSEEN_SPLIT=0 -> đánh giá TOÀN BỘ unseen. Với split cũ unseen chỉ 956 mẫu (21 giây),
+#     nhưng split stratified cho unseen ~30% dữ liệu, tức hàng trăm nghìn mẫu và hàng giờ.
+read -r N_SEEN N_UNSEEN <<EOF
+$("$PYTHON" -c "
+import pickle, sys
+d = sys.argv[1]
+print(len(pickle.load(open(d + '/seen.obj', 'rb'))),
+      len(pickle.load(open(d + '/unseen.obj', 'rb'))))
+" "$SPLIT_DIR")
+EOF
+frac_for() {   # frac_for <tong> <so mau muon giu lai o duoi>
+    awk "BEGIN{v = 1 - $2/$1; if (v < 0) v = 0; printf \"%.6f\", v}"
+}
+[ "$VAL_SPLIT" = "auto" ] && VAL_SPLIT=$(frac_for "$N_SEEN" "$VAL_TARGET")
+[ "$EVAL_UNSEEN_SPLIT" = "auto" ] && EVAL_UNSEEN_SPLIT=$(frac_for "$N_UNSEEN" "$EVAL_UNSEEN_TARGET")
+echo "SPLIT_SIZES seen=$N_SEEN unseen=$N_UNSEEN"
+echo "CONFIG VAL_SPLIT=$VAL_SPLIT (~$(awk "BEGIN{printf \"%d\", $N_SEEN*(1-$VAL_SPLIT)}") mẫu holdout)"
+echo "CONFIG EVAL_UNSEEN_SPLIT=$EVAL_UNSEEN_SPLIT (~$(awk "BEGIN{printf \"%d\", $N_UNSEEN*(1-$EVAL_UNSEEN_SPLIT)}") mẫu)"
+
 # ---------------------------------------------------- 2/5 trọng số alignment --
 echo "STAGE=ALIGN_WEIGHTS AT=$(date --iso-8601=seconds)"
 if [ -f "$DATA_DIR/align_weights.npz" ]; then
@@ -173,6 +249,7 @@ printf "%s\n" \
     "network=$NETWORK" "init_from=$INIT_FROM" "epochs=$EPOCHS" \
     "batches_per_epoch=$BATCHES_PER_EPOCH" "batch_size=$BATCH_SIZE" \
     "input_size=$INPUT_SIZE" "val_split=$VAL_SPLIT" "val_augment=0" \
+    "eval_unseen_split=$EVAL_UNSEEN_SPLIT" "n_seen=$N_SEEN" "n_unseen=$N_UNSEEN" \
     "lr=$LR" "lr_schedule=$LR_SCHEDULE" "use_text=$USE_TEXT" \
     "w_align=$W_ALIGN" "w_agnostic=$W_AGNOSTIC" "w_token=$W_TOKEN" \
     "mask_angle_loss=$MASK_ANGLE_LOSS" "single_part_weight=$SINGLE_PART_WEIGHT" \
@@ -262,8 +339,8 @@ EXTRA=(); [ "$USE_TEXT" = "1" ] && EXTRA=(--align-eval)
 
 echo "-- seen (Base), đúng phần holdout dùng để chọn checkpoint --"
 run_eval 1 "$VAL_SPLIT" eval_seen.log "${EXTRA[@]}"
-echo "-- unseen (New), toàn bộ --"
-run_eval 0 0.0 eval_unseen.log "${EXTRA[@]}"
+echo "-- unseen (New), mẫu con ~$EVAL_UNSEEN_TARGET để eval không kéo dài hàng giờ --"
+run_eval 0 "$EVAL_UNSEEN_SPLIT" eval_unseen.log "${EXTRA[@]}"
 
 SEEN=$(awk '/IOU Results:/ {print $NF}' "$RUN_RESULTS/eval_seen.log" | tail -1)
 UNSEEN=$(awk '/IOU Results:/ {print $NF}' "$RUN_RESULTS/eval_unseen.log" | tail -1)
