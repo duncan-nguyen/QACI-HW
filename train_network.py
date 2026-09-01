@@ -185,6 +185,13 @@ def parse_args():
     )
     parser.add_argument("--num-workers", type=int, default=8, help="Dataset workers")
     parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Số batch mỗi DataLoader worker chuẩn bị trước. Giá trị lớn nhân rất nhanh "
+        "với batch-size và num-workers, có thể làm hệ điều hành SIGKILL vì hết RAM.",
+    )
+    parser.add_argument(
         "--tokenize-in-loader",
         type=int,
         default=1,
@@ -844,20 +851,37 @@ def run():
     # train() tạo lại iterator sau mỗi vòng `while batch_idx <= batches_per_epoch`, nên
     # persistent_workers tiết kiệm hẳn việc spawn lại worker. Loader của GA++ nặng CPU
     # (decode JPEG + rotate/zoom cho ảnh, part_mask và M_union) nên prefetch cũng đáng.
-    loader_kwargs = dict(num_workers=args.num_workers)
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor phải >= 1")
+
+    train_loader_kwargs = dict(num_workers=args.num_workers)
+    eval_loader_kwargs = dict(num_workers=args.num_workers)
     if args.num_workers > 0:
-        loader_kwargs.update(
-            persistent_workers=True, prefetch_factor=4, pin_memory=True
+        train_loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=True,
+        )
+        # Có ba loader eval (normal/shuffled/fixed). Nếu tất cả đều persistent thì sau
+        # counterfactual ta giữ tới 4*num_workers process cùng các queue/pinned batch. Cho
+        # eval worker kết thúc sau mỗi lượt để RAM không tăng theo số condition.
+        eval_loader_kwargs.update(
+            persistent_workers=False,
+            prefetch_factor=min(args.prefetch_factor, 2),
+            pin_memory=True,
         )
 
     train_data = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=train_sampler,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
     val_data = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs
+        val_dataset,
+        batch_size=args.val_batch_size,
+        sampler=val_sampler,
+        **eval_loader_kwargs,
     )
 
     # Loader đối chứng phải dựng *ở đây*: với persistent_workers, đổi thuộc tính dataset ở
@@ -868,9 +892,17 @@ def run():
         shuffled = val_dataset.eval_view().shuffle_prompts(seed=args.random_seed)
         fixed = val_dataset.eval_view().set_fixed_prompt(args.fixed_prompt)
         counterfactual_loaders["shuffled"] = torch.utils.data.DataLoader(
-            shuffled, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs)
+            shuffled,
+            batch_size=args.val_batch_size,
+            sampler=val_sampler,
+            **eval_loader_kwargs,
+        )
         counterfactual_loaders["fixed"] = torch.utils.data.DataLoader(
-            fixed, batch_size=args.val_batch_size, sampler=val_sampler, **loader_kwargs)
+            fixed,
+            batch_size=args.val_batch_size,
+            sampler=val_sampler,
+            **eval_loader_kwargs,
+        )
     logging.info("Done")
 
     # Load the network
